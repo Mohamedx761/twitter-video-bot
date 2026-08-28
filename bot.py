@@ -195,6 +195,53 @@ def download_image_ytdlp(image_url: str, download_path: Path, idx: int) -> str:
     return None
 
 
+def collect_carousel_urls(info: dict) -> list:
+    urls = []
+    edges = info.get("edge_sidecar_to_children", {}).get("edges", [])
+    for edge in edges:
+        node = edge.get("node", {})
+        for res in node.get("display_resources", []):
+            if isinstance(res, dict) and res.get("src"):
+                urls.append(res["src"])
+        img_versions = node.get("image_versions2", {})
+        for c in img_versions.get("candidates", []):
+            if isinstance(c, dict) and c.get("src"):
+                urls.append(c["src"])
+        for res in node.get("display_resources", []):
+            if isinstance(res, dict) and res.get("src"):
+                urls.append(res["src"])
+    seen = set()
+    result = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            result.append(u)
+    return result
+
+
+def get_carousel_image_urls(url: str) -> list:
+    cmd = [
+        "yt-dlp",
+        "--dump-single-json",
+        "--no-download",
+        "--no-warnings",
+        "--no-check-certificates",
+        "--extractor-retries", "3",
+        "--retry-sleep", "1",
+    ] + get_cookie_args() + [url]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.stdout.strip():
+            data = json.loads(result.stdout.strip())
+            if isinstance(data, dict):
+                urls = collect_carousel_urls(data)
+                logger.info(f"Carousel JSON: {len(urls)} image URL(s)")
+                return urls
+    except Exception as e:
+        logger.error(f"Carousel JSON fetch failed: {e}")
+    return []
+
+
 def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: int, app: Application) -> tuple[dict, list]:
     downloaded_files = []
     before_files = set(f.name for f in download_path.iterdir() if f.is_file())
@@ -270,6 +317,11 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
         logger.info(f"Fallback get_json_info returned dict: {isinstance(info, dict)}, keys={list(info.keys())[:10] if info else 'empty'}")
 
     image_urls = collect_image_urls(info)
+    if is_carousel:
+        carousel_urls = get_carousel_image_urls(url)
+        for u in carousel_urls:
+            if u not in image_urls:
+                image_urls.append(u)
     logger.info(f"Found {len(image_urls)} image URL(s): {[u[:60] for u in image_urls[:5]]}")
     seen_hashes = set()
     image_idx = 0
