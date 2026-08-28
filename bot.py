@@ -18,9 +18,9 @@ from telegram.ext import (
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
-DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip().strip('"').strip("'")
+AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0").strip().strip('"').strip("'"))
+DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads").strip().strip('"').strip("'"))
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 logging.basicConfig(
