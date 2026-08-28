@@ -232,18 +232,41 @@ def get_carousel_image_urls(url: str) -> list:
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.stdout.strip():
-            data = json.loads(result.stdout.strip())
+            raw = result.stdout.strip()
+            logger.info(f"Carousel JSON stdout length: {len(raw)}")
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                logger.error(f"Carousel JSON parse error: {raw[:500]}")
+                return []
             if isinstance(data, dict):
                 logger.info(f"Carousel JSON top keys: {list(data.keys())[:20]}")
                 if "edge_sidecar_to_children" in data:
                     children = data["edge_sidecar_to_children"]
-                    logger.info(f"edge_sidecar_to_children keys: {list(children.keys()) if isinstance(children, dict) else type(children)}")
+                    if isinstance(children, dict):
+                        edges = children.get("edges", [])
+                        logger.info(f"edge_sidecar_to_children.edges count: {len(edges)}")
+                        if edges:
+                            logger.info(f"First edge keys: {list(edges[0].keys()) if isinstance(edges[0], dict) else edges[0]}")
+                            node = edges[0].get("node", {})
+                            logger.info(f"First node keys: {list(node.keys()) if isinstance(node, dict) else node}")
+                            dr = node.get("display_resources", []) if isinstance(node, dict) else []
+                            logger.info(f"First node display_resources count: {len(dr)}")
+                            if dr:
+                                logger.info(f"First display_resource keys: {list(dr[0].keys()) if isinstance(dr[0], dict) else dr[0]}")
                 urls = collect_carousel_urls(data)
                 logger.info(f"Carousel JSON: {len(urls)} image URL(s)")
                 return urls
+            elif isinstance(data, list):
+                logger.info(f"Carousel JSON is list of {len(data)} items")
+                urls = []
+                for item in data:
+                    if isinstance(item, dict):
+                        urls.extend(collect_carousel_urls(item))
+                logger.info(f"Carousel JSON from list: {len(urls)} image URL(s)")
+                return urls
             else:
-                logger.error(f"Carousel JSON returned non-dict: {type(data)}")
-                logger.error(f"Carousel JSON stdout[:500]: {result.stdout.strip()[:500]}")
+                logger.error(f"Carousel JSON returned {type(data)}: {raw[:500]}")
     except Exception as e:
         logger.error(f"Carousel JSON fetch failed: {e}")
     return []
