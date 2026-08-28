@@ -21,6 +21,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads"))
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+PORT = int(os.getenv("PORT", "8080"))
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -70,7 +71,6 @@ def make_progress_bar(percent: int) -> str:
 cancel_keyboard = InlineKeyboardMarkup(
     [[InlineKeyboardButton("Cancel", callback_data="cancel_download")]]
 )
-
 
 VIDEO_EXTS = ('.mp4', '.mkv', '.webm', '.mov')
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.gif', '.webp')
