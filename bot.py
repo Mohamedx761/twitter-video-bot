@@ -198,8 +198,10 @@ def download_image_ytdlp(image_url: str, download_path: Path, idx: int) -> str:
 def collect_carousel_urls(info: dict) -> list:
     urls = []
     edges = info.get("edge_sidecar_to_children", {}).get("edges", [])
-    for edge in edges:
+    logger.info(f"Carousel edges found: {len(edges)}")
+    for i, edge in enumerate(edges):
         node = edge.get("node", {})
+        logger.info(f"Edge {i}: keys={list(node.keys())[:15]}")
         for res in node.get("display_resources", []):
             if isinstance(res, dict) and res.get("src"):
                 urls.append(res["src"])
@@ -207,9 +209,7 @@ def collect_carousel_urls(info: dict) -> list:
         for c in img_versions.get("candidates", []):
             if isinstance(c, dict) and c.get("src"):
                 urls.append(c["src"])
-        for res in node.get("display_resources", []):
-            if isinstance(res, dict) and res.get("src"):
-                urls.append(res["src"])
+    logger.info(f"Carousel collected {len(urls)} URLs before dedupe")
     seen = set()
     result = []
     for u in urls:
@@ -234,9 +234,16 @@ def get_carousel_image_urls(url: str) -> list:
         if result.stdout.strip():
             data = json.loads(result.stdout.strip())
             if isinstance(data, dict):
+                logger.info(f"Carousel JSON top keys: {list(data.keys())[:20]}")
+                if "edge_sidecar_to_children" in data:
+                    children = data["edge_sidecar_to_children"]
+                    logger.info(f"edge_sidecar_to_children keys: {list(children.keys()) if isinstance(children, dict) else type(children)}")
                 urls = collect_carousel_urls(data)
                 logger.info(f"Carousel JSON: {len(urls)} image URL(s)")
                 return urls
+            else:
+                logger.error(f"Carousel JSON returned non-dict: {type(data)}")
+                logger.error(f"Carousel JSON stdout[:500]: {result.stdout.strip()[:500]}")
     except Exception as e:
         logger.error(f"Carousel JSON fetch failed: {e}")
     return []
