@@ -76,52 +76,14 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
     downloaded_files = []
     before_files = set(f.name for f in download_path.iterdir() if f.is_file())
 
-    info_file = download_path / "info.json"
-
-    cmd = [
-        "yt-dlp",
-        "--dump-json",
-        "--no-warnings",
-        "--no-check-certificates",
-        "-o", str(download_path / "%(autonumber)s_%(id)s.%(ext)s"),
-        "--extractor-retries", "3",
-        "--retry-sleep", "1",
-        url,
-    ]
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode != 0:
-            error = result.stderr.strip()
-            if "No video" in error or "could not be found" in error:
-                raise ValueError("No media found in this post.")
-            elif "Private" in error or "protected" in error:
-                raise ValueError("This post is from a private account.")
-            elif "HTTP Error 404" in error:
-                raise ValueError("Post not found or has been deleted.")
-            else:
-                raise ValueError(error[:200] if error else "Download failed.")
-    except subprocess.TimeoutExpired:
-        raise ValueError("Download timed out.")
-    except FileNotFoundError:
-        raise ValueError("yt-dlp not found on server.")
-
-    info = {}
-    if result.stdout.strip():
-        try:
-            first_line = result.stdout.strip().split('\n')[0]
-            info = json.loads(first_line)
-        except json.JSONDecodeError:
-            info = {"title": "Media"}
-
     cmd_download = [
         "yt-dlp",
         "--no-warnings",
         "--no-check-certificates",
         "-o", str(download_path / "%(autonumber)s_%(id)s.%(ext)s"),
-        "--no-overwrites",
         "--extractor-retries", "3",
         "--retry-sleep", "1",
+        "--verbose",
         url,
     ]
 
@@ -131,7 +93,21 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
         stderr=subprocess.PIPE,
         text=True,
     )
-    _, stderr = proc.communicate(timeout=300)
+    stdout, stderr = proc.communicate(timeout=300)
+    
+    logger.info(f"yt-dlp stdout: {stdout[:500]}")
+    logger.info(f"yt-dlp stderr: {stderr[:500]}")
+
+    info = {}
+    if stdout.strip():
+        for line in stdout.strip().split('\n'):
+            line = line.strip()
+            if line.startswith('{') and line.endswith('}'):
+                try:
+                    info = json.loads(line)
+                    break
+                except json.JSONDecodeError:
+                    pass
 
     after_files = set(f.name for f in download_path.iterdir() if f.is_file())
     new_files = after_files - before_files
@@ -143,8 +119,20 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
 
     if not downloaded_files:
         for f in download_path.iterdir():
-            if f.is_file() and f.stat().st_size > 0 and f.name != "info.json":
+            if f.is_file() and f.stat().st_size > 0:
                 downloaded_files.append(str(f))
+
+    if not downloaded_files:
+        if "No video" in stderr or "could not be found" in stderr:
+            raise ValueError("No media found in this post.")
+        elif "Private" in stderr or "protected" in stderr:
+            raise ValueError("This post is from a private account.")
+        elif "HTTP Error 404" in stderr:
+            raise ValueError("Post not found or has been deleted.")
+        elif stderr.strip():
+            raise ValueError(stderr.strip()[:200])
+        else:
+            raise ValueError("Download failed. No files were created.")
 
     return info, downloaded_files
 
