@@ -6,14 +6,14 @@ import subprocess
 import json
 from pathlib import Path
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    ContextTypes,
     filters,
+    ContextTypes,
 )
 
 load_dotenv()
@@ -66,6 +66,11 @@ def make_progress_bar(percent: int) -> str:
 
 cancel_keyboard = InlineKeyboardMarkup(
     [[InlineKeyboardButton("Cancel", callback_data="cancel_download")]]
+)
+
+start_keyboard = ReplyKeyboardMarkup(
+    [[KeyboardButton("Start")]],
+    resize_keyboard=True,
 )
 
 VIDEO_EXTS = ('.mp4', '.mkv', '.webm', '.mov')
@@ -147,7 +152,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- X/Twitter videos and images\n"
         "- Instagram posts, reels, stories\n"
         "- Facebook videos and reels\n"
-        "- TikTok videos"
+        "- TikTok videos",
+        reply_markup=start_keyboard,
     )
 
 
@@ -166,7 +172,12 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Bot is for personal use only.")
         return
 
-    url = update.message.text.strip()
+    text = update.message.text.strip()
+    if text == "Start":
+        await start(update, context)
+        return
+
+    url = text
     if not is_valid_url(url):
         await update.message.reply_text(
             "Please send a valid link.\n\n"
