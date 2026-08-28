@@ -21,7 +21,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads"))
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-PORT = int(os.getenv("PORT", "8080"))
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -34,7 +33,15 @@ X_URL_PATTERN = re.compile(
 )
 
 INSTAGRAM_URL_PATTERN = re.compile(
-    r"(https?://)?(www\.)?(instagram\.com)/(p|reel|tv)/\S+"
+    r"(https?://)?(www\.)?(instagram\.com)/(p|reel|tv|stories)/\S+"
+)
+
+FACEBOOK_URL_PATTERN = re.compile(
+    r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/.*/(videos|posts)/\S+|"
+    r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/permalink\.php|"
+    r"(https?://)?fb\.watch/\S+|"
+    r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/share/\S+|"
+    r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/reel/\S+"
 )
 
 cancelled_downloads = {}
@@ -47,7 +54,12 @@ def is_authorized(user_id: int) -> bool:
 
 
 def is_valid_url(url: str) -> bool:
-    return bool(X_URL_PATTERN.match(url.strip())) or bool(INSTAGRAM_URL_PATTERN.match(url.strip()))
+    url = url.strip()
+    return (
+        bool(X_URL_PATTERN.match(url))
+        or bool(INSTAGRAM_URL_PATTERN.match(url))
+        or bool(FACEBOOK_URL_PATTERN.match(url))
+    )
 
 
 def clean_url(url: str) -> str:
@@ -56,6 +68,10 @@ def clean_url(url: str) -> str:
         url = url.split("?")[0]
     if "twitter.com" in url:
         url = url.replace("twitter.com", "x.com")
+    if "m.facebook.com" in url:
+        url = url.replace("m.facebook.com", "www.facebook.com")
+    if "web.facebook.com" in url:
+        url = url.replace("web.facebook.com", "www.facebook.com")
     if not url.startswith("http"):
         url = "https://" + url
     return url
@@ -171,10 +187,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Bot is for personal use only.")
         return
     await update.message.reply_text(
-        "Send me a link from X (Twitter) or Instagram and I will download it.\n\n"
-        "Supported:\n"
+        "Send me a link and I will download it for you.\n\n"
+        "Supported platforms:\n"
         "- X/Twitter videos and images\n"
-        "- Instagram posts, reels, and videos"
+        "- Instagram posts, reels, stories, and videos\n"
+        "- Facebook videos and reels"
     )
 
 
@@ -197,10 +214,12 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     if not is_valid_url(url):
         await update.message.reply_text(
-            "Please send a valid link from X or Instagram.\n\n"
-            "Examples:\n"
-            "- https://x.com/user/status/123456\n"
-            "- https://www.instagram.com/p/ABC123/"
+            "Please send a valid link.\n\n"
+            "Supported platforms:\n"
+            "- X/Twitter: https://x.com/user/status/123\n"
+            "- Instagram: https://www.instagram.com/p/ABC/\n"
+            "- Facebook: https://www.facebook.com/user/posts/123\n"
+            "- Facebook Watch: https://fb.watch/abc/"
         )
         return
 
