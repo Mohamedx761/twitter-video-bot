@@ -2,6 +2,8 @@ import os
 import asyncio
 import logging
 import re
+import subprocess
+import json
 from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -13,7 +15,6 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-import yt_dlp
 
 load_dotenv()
 
@@ -28,22 +29,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-X_URL_PATTERN = re.compile(
-    r"(https?://)?(www\.)?(x\.com|twitter\.com)/\S+/status/\d+"
-)
-
-INSTAGRAM_URL_PATTERN = re.compile(
-    r"(https?://)?(www\.)?(instagram\.com)/(p|reel|tv|stories)/\S+"
-)
-
-FACEBOOK_URL_PATTERN = re.compile(
-    r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/.*/(videos|posts)/\S+|"
-    r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/permalink\.php|"
-    r"(https?://)?fb\.watch/\S+|"
-    r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/share/\S+|"
-    r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/reel/\S+"
-)
-
 cancelled_downloads = {}
 
 
@@ -55,26 +40,19 @@ def is_authorized(user_id: int) -> bool:
 
 def is_valid_url(url: str) -> bool:
     url = url.strip()
-    return (
-        bool(X_URL_PATTERN.match(url))
-        or bool(INSTAGRAM_URL_PATTERN.match(url))
-        or bool(FACEBOOK_URL_PATTERN.match(url))
-    )
-
-
-def clean_url(url: str) -> str:
-    url = url.strip()
-    if "?" in url:
-        url = url.split("?")[0]
-    if "twitter.com" in url:
-        url = url.replace("twitter.com", "x.com")
-    if "m.facebook.com" in url:
-        url = url.replace("m.facebook.com", "www.facebook.com")
-    if "web.facebook.com" in url:
-        url = url.replace("web.facebook.com", "www.facebook.com")
-    if not url.startswith("http"):
-        url = "https://" + url
-    return url
+    patterns = [
+        r"(https?://)?(www\.)?(x\.com|twitter\.com)/\S+/status/\d+",
+        r"(https?://)?(www\.)?(instagram\.com)/(p|reel|tv|stories)/\S+",
+        r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/.*/(videos|posts)/\S+",
+        r"(https?://)?fb\.watch/\S+",
+        r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/reel/\S+",
+        r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/share/\S+",
+        r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/permalink\.php",
+    ]
+    for pattern in patterns:
+        if re.match(pattern, url):
+            return True
+    return False
 
 
 def make_progress_bar(percent: int) -> str:
@@ -93,78 +71,59 @@ IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.gif', '.webp')
 
 
 def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: int, app: Application) -> tuple[dict, list]:
-    cleaned_url = clean_url(url)
     downloaded_files = []
-
     before_files = set(f.name for f in download_path.iterdir() if f.is_file())
 
-    def progress_hook(d):
-        if cancelled_downloads.get(chat_id):
-            raise yt_dlp.utils.DownloadCancelled("Cancelled")
+    info_file = download_path / "info.json"
 
-        if d["status"] == "downloading":
-            total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
-            downloaded = d.get("downloaded_bytes", 0)
-            speed = d.get("speed", 0)
-            eta = d.get("eta", 0)
+    cmd = [
+        "yt-dlp",
+        "--dump-json",
+        "--no-warnings",
+        "-o", str(download_path / "%(autonumber)s_%(id)s.%(ext)s"),
+        url,
+    ]
 
-            if total > 0:
-                percent = int((downloaded / total) * 100)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            error = result.stderr.strip()
+            if "No video" in error or "could not be found" in error:
+                raise ValueError("No media found in this post.")
+            elif "Private" in error or "protected" in error:
+                raise ValueError("This post is from a private account.")
+            elif "HTTP Error 404" in error:
+                raise ValueError("Post not found or has been deleted.")
             else:
-                percent = 0
+                raise ValueError(error[:200] if error else "Download failed.")
+    except subprocess.TimeoutExpired:
+        raise ValueError("Download timed out.")
+    except FileNotFoundError:
+        raise ValueError("yt-dlp not found on server.")
 
-            speed_mb = speed / (1024 * 1024) if speed else 0
-            downloaded_mb = downloaded / (1024 * 1024)
-            total_mb = total / (1024 * 1024) if total else 0
+    info = {}
+    if result.stdout.strip():
+        try:
+            first_line = result.stdout.strip().split('\n')[0]
+            info = json.loads(first_line)
+        except json.JSONDecodeError:
+            info = {"title": "Media"}
 
-            bar = make_progress_bar(percent)
-            text = f"Downloading...\n\n{bar}\n\n"
-            text += f"Downloaded: {downloaded_mb:.1f}/{total_mb:.1f} MB\n"
-            text += f"Speed: {speed_mb:.1f} MB/s\n"
-            text += f"Time left: {eta}s" if eta else "Time left: calculating..."
+    cmd_download = [
+        "yt-dlp",
+        "--no-warnings",
+        "-o", str(download_path / "%(autonumber)s_%(id)s.%(ext)s"),
+        "--no-overwrites",
+        url,
+    ]
 
-            try:
-                app.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=status_msg_id,
-                    text=text,
-                    reply_markup=cancel_keyboard,
-                )
-            except Exception:
-                pass
-
-        elif d["status"] == "finished":
-            try:
-                total_bytes = d.get("total_bytes", 0)
-                total_mb = total_bytes / (1024 * 1024)
-                app.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=status_msg_id,
-                    text=f"Download complete!\n\nFile size: {total_mb:.1f} MB\nUploading...",
-                )
-            except Exception:
-                pass
-
-    ydl_opts = {
-        "outtmpl": str(download_path / "%(id)s.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-        "max_filesize": 50 * 1024 * 1024,
-        "progress_hooks": [progress_hook],
-    }
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(cleaned_url, download=True)
-
-        if not info:
-            raise ValueError("Could not extract info.")
-
-        if "entries" in info:
-            for entry in info["entries"]:
-                if entry:
-                    ydl.download([entry.get("url", cleaned_url)])
-        else:
-            ydl.download([cleaned_url])
+    proc = subprocess.Popen(
+        cmd_download,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    _, stderr = proc.communicate(timeout=300)
 
     after_files = set(f.name for f in download_path.iterdir() if f.is_file())
     new_files = after_files - before_files
@@ -176,7 +135,7 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
 
     if not downloaded_files:
         for f in download_path.iterdir():
-            if f.is_file() and f.stat().st_size > 0:
+            if f.is_file() and f.stat().st_size > 0 and f.name != "info.json":
                 downloaded_files.append(str(f))
 
     return info, downloaded_files
@@ -187,10 +146,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Bot is for personal use only.")
         return
     await update.message.reply_text(
-        "Send me a link and I will download it for you.\n\n"
-        "Supported platforms:\n"
+        "Send me a link and I will download it.\n\n"
+        "Supported:\n"
         "- X/Twitter videos and images\n"
-        "- Instagram posts, reels, stories, and videos\n"
+        "- Instagram posts, reels, stories\n"
         "- Facebook videos and reels"
     )
 
@@ -198,7 +157,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.data == "cancel_download":
         chat_id = query.message.chat.id
         cancelled_downloads[chat_id] = True
@@ -215,11 +173,10 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_valid_url(url):
         await update.message.reply_text(
             "Please send a valid link.\n\n"
-            "Supported platforms:\n"
+            "Supported:\n"
             "- X/Twitter: https://x.com/user/status/123\n"
-            "- Instagram: https://www.instagram.com/p/ABC/\n"
-            "- Facebook: https://www.facebook.com/user/posts/123\n"
-            "- Facebook Watch: https://fb.watch/abc/"
+            "- Instagram: https://instagram.com/p/ABC/\n"
+            "- Facebook: https://facebook.com/user/videos/123"
         )
         return
 
@@ -245,8 +202,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text("No media found.")
             return
 
-        description = info.get("description", "") or info.get("title", "")
-        caption = description if description else ""
+        caption = info.get("description", "") or info.get("title", "") or ""
 
         await status_msg.edit_text(f"Uploading {len(file_paths)} file(s)...")
 
@@ -257,19 +213,23 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
             is_video = file_path.lower().endswith(VIDEO_EXTS)
 
-            if is_video and file_size_mb > 50:
-                await status_msg.edit_text(
-                    f"Video is {file_size_mb:.1f}MB. Compressing..."
-                )
-                compressed_path = str(file_path) + ".compressed.mp4"
-                compress_cmd = (
-                    f'ffmpeg -i "{file_path}" -c:v libx264 -crf 28 '
-                    f'-vf "scale=\'min(1280,iw)\':-2" -c:a aac -b:a 128k '
-                    f'-movflags +faststart "{compressed_path}" -y'
-                )
-                await loop.run_in_executor(None, lambda: os.system(compress_cmd))
-                if os.path.exists(compressed_path) and os.path.getsize(compressed_path) < 50 * 1024 * 1024:
-                    file_path = compressed_path
+            if file_size_mb > 50:
+                if is_video:
+                    await status_msg.edit_text(f"Video is {file_size_mb:.1f}MB. Compressing...")
+                    compressed_path = str(file_path) + ".compressed.mp4"
+                    compress_cmd = (
+                        f'ffmpeg -i "{file_path}" -c:v libx264 -crf 28 '
+                        f'-vf "scale=\'min(1280,iw)\':-2" -c:a aac -b:a 128k '
+                        f'-movflags +faststart "{compressed_path}" -y'
+                    )
+                    await loop.run_in_executor(None, lambda: os.system(compress_cmd))
+                    if os.path.exists(compressed_path) and os.path.getsize(compressed_path) < 50 * 1024 * 1024:
+                        file_path = compressed_path
+                    else:
+                        with open(file_path, "rb") as f:
+                            await update.message.reply_document(document=f, caption=caption)
+                        os.remove(file_path)
+                        continue
                 else:
                     with open(file_path, "rb") as f:
                         await update.message.reply_document(document=f, caption=caption)
@@ -278,33 +238,17 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if is_video:
                 with open(file_path, "rb") as video_file:
-                    await update.message.reply_video(
-                        video=video_file,
-                        caption=caption,
-                    )
+                    await update.message.reply_video(video=video_file, caption=caption)
             else:
                 with open(file_path, "rb") as photo_file:
-                    await update.message.reply_photo(
-                        photo=photo_file,
-                        caption=caption,
-                    )
+                    await update.message.reply_photo(photo=photo_file, caption=caption)
 
         await status_msg.delete()
-
-    except yt_dlp.utils.DownloadCancelled:
-        await status_msg.edit_text("Download cancelled.")
 
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Error: {error_msg}")
-        if "No video" in error_msg or "could not be found" in error_msg:
-            await status_msg.edit_text("No media found in this post.")
-        elif "Private" in error_msg or "protected" in error_msg:
-            await status_msg.edit_text("This post is from a private account.")
-        elif "unavailable" in error_msg or "not found" in error_msg:
-            await status_msg.edit_text("This post is unavailable or has been deleted.")
-        else:
-            await status_msg.edit_text(f"Error: {error_msg[:200]}")
+        await status_msg.edit_text(f"Error: {error_msg[:200]}")
 
     finally:
         cancelled_downloads.pop(chat_id, None)
