@@ -7,7 +7,7 @@ import json
 import hashlib
 from pathlib import Path
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, InputMediaVideo
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, InputMediaVideo, InputFile
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -465,13 +465,13 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         photos = [fp for fp in file_paths if fp.lower().endswith(IMAGE_EXTS)]
         videos = [fp for fp in file_paths if fp.lower().endswith(VIDEO_EXTS)]
-        compressed_files = []
-        caption = (info or {}).get("description", "") or (info or {}).get("title", "") or ""
 
         if photos:
+            caption = (info or {}).get("description", "") or (info or {}).get("title", "") or ""
             for i in range(0, len(photos), 10):
                 group = photos[i:i+10]
                 media = []
+                files = []
                 for photo_path in group:
                     if not os.path.exists(photo_path):
                         continue
@@ -486,21 +486,19 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         ]))
                         if os.path.exists(cpath) and os.path.getsize(cpath) < 10 * 1024 * 1024:
                             use_path = cpath
-                            compressed_files.append(cpath)
-                    media.append(InputMediaPhoto(media=use_path, caption=caption if i == 0 else None))
+                    fname = Path(use_path).name
+                    input_file = InputFile(str(use_path))
+                    files.append(input_file)
+                    media.append(InputMediaPhoto(media=f"attach://{fname}", caption=caption))
                 try:
-                    await context.bot.send_media_group(chat_id=chat_id, media=media)
+                    await context.bot.send_media_group(chat_id=chat_id, media=media, files=files)
+                    logger.info(f"send_media_group sent {len(group)} photo(s)")
                 except Exception as e:
-                    logger.error(f"send_media_group failed: {e}, falling back")
+                    logger.error(f"send_media_group failed: {e}, falling back to individual sends")
                     for photo_path in group:
                         if os.path.exists(photo_path):
                             with open(photo_path, "rb") as pf:
                                 await update.message.reply_photo(photo=pf, caption=caption)
-            for cf in compressed_files:
-                try:
-                    os.remove(cf)
-                except Exception:
-                    pass
 
         for video_path in videos:
             if not os.path.exists(video_path):
