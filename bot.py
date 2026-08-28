@@ -385,7 +385,15 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
 
     if not downloaded_files:
         if is_x:
-            raise ValueError("X/Twitter requires cookies/authentication to download. Please provide cookies in the env (COOKIES_FILE).")
+            raise ValueError(
+                "X/Twitter requires cookies to download.\n\n"
+                "جرب الحل ده:\n"
+                "1. فتح x.com من المتصفح في التليفون\n"
+                "2. نزّل اضافة \"Get cookies.txt\" من متجر المتصفح\n"
+                "3. ادخل x.com واعمل Export للـ cookies\n"
+                "4. ابعت ملف cookies.txt للبوت بالأمر /cookies\n\n"
+                "أو ابعت ملف cookies.txt كملحق مع الأمر /cookies"
+            )
         raise ValueError("No media found in this post. The post may be private or require login.")
 
     return info, downloaded_files
@@ -413,6 +421,41 @@ async def cancel_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = query.message.chat.id
         cancelled_downloads[chat_id] = True
         await query.edit_message_text("Download cancelled.")
+
+
+async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global COOKIES_FILE
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Bot is for personal use only.")
+        return
+
+    if update.message.document:
+        file_id = update.message.document.file_id
+        cookies_path = COOKIES_FILE if COOKIES_FILE else "cookies.txt"
+        try:
+            file = await context.bot.get_file(file_id)
+            await file.download(cookies_path)
+            COOKIES_FILE = cookies_path
+            await update.message.reply_text(
+                "✅ Cookies uploaded successfully!\n"
+                "Now try sending an X/Twitter link again.\n\n"
+                "✅ ملف الكوكيز اتحمل بنجاح!\n"
+                "جرب ابعت لنك اكس تاني الحين."
+            )
+            logger.info("Cookies file uploaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to upload cookies: {e}")
+            await update.message.reply_text(f"Failed to upload cookies: {e}")
+    else:
+        await update.message.reply_text(
+            "Send me your cookies.txt file.\n\n"
+            "ابعتلي ملف cookies.txt بتاعك.\n\n"
+            "How to get cookies:\n"
+            "1. Install 'Get cookies.txt' extension on your phone browser\n"
+            "2. Visit x.com\n"
+            "3. Tap the extension → Export\n"
+            "4. Send the cookies.txt file here with /cookies command"
+        )
 
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -547,6 +590,7 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", start))
+    application.add_handler(CommandHandler("cookies", cookies_command))
     application.add_handler(CallbackQueryHandler(cancel_button))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
 
