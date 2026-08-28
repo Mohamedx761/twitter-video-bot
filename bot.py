@@ -83,7 +83,8 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
 
     cmd_info = [
         "yt-dlp",
-        "--dump-json",
+        "--dump-single-json",
+        "--flat-playlist",
         "--no-warnings",
         "--no-check-certificates",
         url,
@@ -98,43 +99,40 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
 
     info = {}
     if result.stdout.strip():
-        for line in result.stdout.strip().split('\n'):
-            line = line.strip()
-            if line.startswith('{') and line.endswith('}'):
-                try:
-                    info = json.loads(line)
-                    break
-                except json.JSONDecodeError:
-                    pass
+        try:
+            info = json.loads(result.stdout.strip())
+        except json.JSONDecodeError:
+            pass
 
-    entries = info.get("entries") or [info]
+    entries = info.get("entries") or []
 
-    for entry in entries:
-        if entry is None:
-            continue
-        entry_url = entry.get("url") or entry.get("webpage_url") or url
-        entry_id = entry.get("id", "unknown")
-        ext = entry.get("ext", "mp4")
-        filename = f"{entry_id}.{ext}"
-        filepath = download_path / filename
+    if entries:
+        for entry in entries:
+            if entry is None:
+                continue
+            entry_id = entry.get("id", "")
+            webpage_url = entry.get("webpage_url") or entry.get("url") or url
 
-        cmd_dl = [
-            "yt-dlp",
-            "--no-warnings",
-            "--no-check-certificates",
-            "-o", str(filepath),
-            "--no-overwrites",
-            entry_url,
-        ]
+            cmd_dl = [
+                "yt-dlp",
+                "--no-warnings",
+                "--no-check-certificates",
+                "-o", str(download_path / f"{entry_id}.%(ext)s"),
+                "--no-overwrites",
+                webpage_url,
+            ]
+            proc = subprocess.Popen(cmd_dl, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            proc.communicate(timeout=300)
 
-        proc = subprocess.Popen(cmd_dl, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        proc.communicate(timeout=300)
-
-        if filepath.is_file() and filepath.stat().st_size > 0:
-            downloaded_files.append(str(filepath))
+        after_files = set(f.name for f in download_path.iterdir() if f.is_file())
+        new_files = after_files - before_files
+        for fname in sorted(new_files):
+            fpath = download_path / fname
+            if fpath.is_file() and fpath.stat().st_size > 0:
+                downloaded_files.append(str(fpath))
 
     if not downloaded_files:
-        cmd_fallback = [
+        cmd_dl = [
             "yt-dlp",
             "--no-warnings",
             "--no-check-certificates",
@@ -142,7 +140,7 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
             "--no-overwrites",
             url,
         ]
-        proc = subprocess.Popen(cmd_fallback, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = subprocess.Popen(cmd_dl, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         proc.communicate(timeout=300)
 
         after_files = set(f.name for f in download_path.iterdir() if f.is_file())
@@ -153,9 +151,7 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
                 downloaded_files.append(str(fpath))
 
     if not downloaded_files:
-        stderr = ""
-        if result.stderr:
-            stderr = result.stderr.strip()
+        stderr = result.stderr.strip() if result.stderr else ""
         if "No video" in stderr or "could not be found" in stderr:
             raise ValueError("No media found in this post.")
         elif "Private" in stderr or "protected" in stderr:
