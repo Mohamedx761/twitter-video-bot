@@ -81,31 +81,24 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
     downloaded_files = []
     before_files = set(f.name for f in download_path.iterdir() if f.is_file())
 
-    cmd_download = [
+    cmd_info = [
         "yt-dlp",
+        "--dump-json",
         "--no-warnings",
         "--no-check-certificates",
-        "-o", str(download_path / "%(autonumber)s_%(id)s.%(ext)s"),
-        "--extractor-retries", "3",
-        "--retry-sleep", "1",
-        "--verbose",
         url,
     ]
 
-    proc = subprocess.Popen(
-        cmd_download,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    stdout, stderr = proc.communicate(timeout=300)
-    
-    logger.info(f"yt-dlp stdout: {stdout[:500]}")
-    logger.info(f"yt-dlp stderr: {stderr[:500]}")
+    try:
+        result = subprocess.run(cmd_info, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        raise ValueError("Timeout while getting info.")
+    except FileNotFoundError:
+        raise ValueError("yt-dlp not found.")
 
     info = {}
-    if stdout.strip():
-        for line in stdout.strip().split('\n'):
+    if result.stdout.strip():
+        for line in result.stdout.strip().split('\n'):
             line = line.strip()
             if line.startswith('{') and line.endswith('}'):
                 try:
@@ -114,30 +107,63 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
                 except json.JSONDecodeError:
                     pass
 
-    after_files = set(f.name for f in download_path.iterdir() if f.is_file())
-    new_files = after_files - before_files
+    entries = info.get("entries") or [info]
 
-    for fname in sorted(new_files):
-        fpath = download_path / fname
-        if fpath.is_file() and fpath.stat().st_size > 0:
-            downloaded_files.append(str(fpath))
+    for entry in entries:
+        if entry is None:
+            continue
+        entry_url = entry.get("url") or entry.get("webpage_url") or url
+        entry_id = entry.get("id", "unknown")
+        ext = entry.get("ext", "mp4")
+        filename = f"{entry_id}.{ext}"
+        filepath = download_path / filename
+
+        cmd_dl = [
+            "yt-dlp",
+            "--no-warnings",
+            "--no-check-certificates",
+            "-o", str(filepath),
+            "--no-overwrites",
+            entry_url,
+        ]
+
+        proc = subprocess.Popen(cmd_dl, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc.communicate(timeout=300)
+
+        if filepath.is_file() and filepath.stat().st_size > 0:
+            downloaded_files.append(str(filepath))
 
     if not downloaded_files:
-        for f in download_path.iterdir():
-            if f.is_file() and f.stat().st_size > 0:
-                downloaded_files.append(str(f))
+        cmd_fallback = [
+            "yt-dlp",
+            "--no-warnings",
+            "--no-check-certificates",
+            "-o", str(download_path / "%(autonumber)s_%(id)s.%(ext)s"),
+            "--no-overwrites",
+            url,
+        ]
+        proc = subprocess.Popen(cmd_fallback, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc.communicate(timeout=300)
+
+        after_files = set(f.name for f in download_path.iterdir() if f.is_file())
+        new_files = after_files - before_files
+        for fname in sorted(new_files):
+            fpath = download_path / fname
+            if fpath.is_file() and fpath.stat().st_size > 0:
+                downloaded_files.append(str(fpath))
 
     if not downloaded_files:
+        stderr = ""
+        if result.stderr:
+            stderr = result.stderr.strip()
         if "No video" in stderr or "could not be found" in stderr:
             raise ValueError("No media found in this post.")
         elif "Private" in stderr or "protected" in stderr:
             raise ValueError("This post is from a private account.")
         elif "HTTP Error 404" in stderr:
             raise ValueError("Post not found or has been deleted.")
-        elif stderr.strip():
-            raise ValueError(stderr.strip()[:200])
         else:
-            raise ValueError("Download failed. No files were created.")
+            raise ValueError("Download failed.")
 
     return info, downloaded_files
 
