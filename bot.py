@@ -48,6 +48,8 @@ def is_valid_url(url: str) -> bool:
         r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/reel/\S+",
         r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/share/\S+",
         r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/permalink\.php",
+        r"(https?://)?vm\.tiktok\.com/\S+",
+        r"(https?://)?(www\.)?tiktok\.com/@\S+/video/\d+",
     ]
     for pattern in patterns:
         if re.match(pattern, url):
@@ -80,7 +82,10 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
         "yt-dlp",
         "--dump-json",
         "--no-warnings",
+        "--no-check-certificates",
         "-o", str(download_path / "%(autonumber)s_%(id)s.%(ext)s"),
+        "--extractor-retries", "3",
+        "--retry-sleep", "1",
         url,
     ]
 
@@ -112,8 +117,11 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
     cmd_download = [
         "yt-dlp",
         "--no-warnings",
+        "--no-check-certificates",
         "-o", str(download_path / "%(autonumber)s_%(id)s.%(ext)s"),
         "--no-overwrites",
+        "--extractor-retries", "3",
+        "--retry-sleep", "1",
         url,
     ]
 
@@ -150,7 +158,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Supported:\n"
         "- X/Twitter videos and images\n"
         "- Instagram posts, reels, stories\n"
-        "- Facebook videos and reels"
+        "- Facebook videos and reels\n"
+        "- TikTok videos"
     )
 
 
