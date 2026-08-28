@@ -7,7 +7,7 @@ import json
 import hashlib
 from pathlib import Path
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, InputMediaVideo
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -319,18 +319,17 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
     except FileNotFoundError:
         raise ValueError("yt-dlp not found.")
 
+    all_image_urls = []
     info = {}
-    best_info = {}
-    best_count = 0
     for f in sorted(download_path.glob("*.info.json")):
         try:
             with open(f) as fp:
                 data = json.load(fp)
                 urls = collect_image_urls(data)
+                all_image_urls.extend(urls)
+                if not info:
+                    info = data
                 logger.info(f"Info file {f.name}: {len(urls)} image URL(s), keys={list(data.keys())[:10]}")
-                if len(urls) > best_count:
-                    best_count = len(urls)
-                    best_info = data
                 try:
                     f.unlink()
                 except Exception:
@@ -338,21 +337,17 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
         except Exception as e:
             logger.error(f"Failed to read info file {f.name}: {e}")
             continue
-    if best_count > 0:
-        info = best_info
-        logger.info(f"Using best info file: {best_count} image URLs")
+    logger.info(f"All info files: {len(all_image_urls)} image URL(s) total")
 
-    if not info:
-        info = get_json_info(url)
-        logger.info(f"Fallback get_json_info returned dict: {isinstance(info, dict)}, keys={list(info.keys())[:10] if info else 'empty'}")
-
-    image_urls = collect_image_urls(info)
-    if is_carousel:
+    if is_carousel and not all_image_urls:
         carousel_urls = get_carousel_image_urls(url)
         for u in carousel_urls:
-            if u not in image_urls:
-                image_urls.append(u)
-    logger.info(f"Found {len(image_urls)} image URL(s): {[u[:60] for u in image_urls[:5]]}")
+            if u not in all_image_urls:
+                all_image_urls.append(u)
+        logger.info(f"After carousel fetch: {len(all_image_urls)} image URL(s)")
+
+    image_urls = all_image_urls
+    logger.info(f"Final image URL(s): {len(image_urls)}")
     seen_hashes = set()
     image_idx = 0
     for image_url in image_urls:
@@ -468,44 +463,66 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await status_msg.edit_text(f"Uploading {len(file_paths)} file(s)...")
 
-        for file_path in file_paths:
-            if not os.path.exists(file_path):
-                continue
+        photos = [fp for fp in file_paths if fp.lower().endswith(IMAGE_EXTS)]
+        videos = [fp for fp in file_paths if fp.lower().endswith(VIDEO_EXTS)]
+        compressed_files = []
+        caption = (info or {}).get("description", "") or (info or {}).get("title", "") or ""
 
-            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-            is_video = file_path.lower().endswith(VIDEO_EXTS)
-
-            # Telegram: photos max 10MB, videos/documents max 50MB
-            max_size = 50 if is_video else 10
-            if file_size_mb > max_size:
-                if is_video:
-                    await status_msg.edit_text(f"Video is {file_size_mb:.1f}MB. Compressing...")
-                    compressed_path = str(file_path) + ".compressed.mp4"
-                    compress_cmd = (
-                        f'ffmpeg -i "{file_path}" -c:v libx264 -crf 28 '
-                        f'-vf "scale=\'min(1280,iw)\':-2" -c:a aac -b:a 128k '
-                        f'-movflags +faststart "{compressed_path}" -y'
-                    )
-                    await loop.run_in_executor(None, lambda: os.system(compress_cmd))
-                    if os.path.exists(compressed_path) and os.path.getsize(compressed_path) < 50 * 1024 * 1024:
-                        file_path = compressed_path
-                    else:
-                        with open(file_path, "rb") as f:
-                            await update.message.reply_document(document=f, caption=caption)
-                        os.remove(file_path)
+        if photos:
+            for i in range(0, len(photos), 10):
+                group = photos[i:i+10]
+                media = []
+                for photo_path in group:
+                    if not os.path.exists(photo_path):
                         continue
-                else:
-                    with open(file_path, "rb") as f:
-                        await update.message.reply_document(document=f, caption=caption)
-                    os.remove(file_path)
-                    continue
+                    fp_size = os.path.getsize(photo_path) / (1024 * 1024)
+                    use_path = photo_path
+                    if fp_size > 10:
+                        await status_msg.edit_text("Photo too large, compressing...")
+                        cpath = str(photo_path) + ".compressed.jpg"
+                        await loop.run_in_executor(None, lambda p=str(photo_path), c=str(cpath): subprocess.run([
+                            "ffmpeg", "-i", p, "-vf", "scale=min(1280,iw):-2",
+                            "-q:v", "2", c, "-y"
+                        ]))
+                        if os.path.exists(cpath) and os.path.getsize(cpath) < 10 * 1024 * 1024:
+                            use_path = cpath
+                            compressed_files.append(cpath)
+                    media.append(InputMediaPhoto(media=use_path, caption=caption if i == 0 else None))
+                try:
+                    await context.bot.send_media_group(chat_id=chat_id, media=media)
+                except Exception as e:
+                    logger.error(f"send_media_group failed: {e}, falling back")
+                    for photo_path in group:
+                        if os.path.exists(photo_path):
+                            with open(photo_path, "rb") as pf:
+                                await update.message.reply_photo(photo=pf, caption=caption)
+            for cf in compressed_files:
+                try:
+                    os.remove(cf)
+                except Exception:
+                    pass
 
-            if is_video:
-                with open(file_path, "rb") as video_file:
-                    await update.message.reply_video(video=video_file, caption=caption)
-            else:
-                with open(file_path, "rb") as photo_file:
-                    await update.message.reply_photo(photo=photo_file, caption=caption)
+        for video_path in videos:
+            if not os.path.exists(video_path):
+                continue
+            file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+            if file_size_mb > 50:
+                await status_msg.edit_text(f"Video is {file_size_mb:.1f}MB. Compressing...")
+                cpath = str(video_path) + ".compressed.mp4"
+                await loop.run_in_executor(None, lambda v=str(video_path), c=str(cpath): subprocess.run([
+                    "ffmpeg", "-i", v, "-c:v", "libx264", "-crf", "28",
+                    "-vf", "scale=min(1280,iw):-2", "-c:a", "aac", "-b:a", "128k",
+                    "-movflags", "+faststart", c, "-y"
+                ]))
+                if os.path.exists(cpath) and os.path.getsize(cpath) < 50 * 1024 * 1024:
+                    video_path = cpath
+                else:
+                    with open(video_path, "rb") as f:
+                        await update.message.reply_document(document=f, caption=caption)
+                    os.remove(video_path)
+                    continue
+            with open(video_path, "rb") as vf:
+                await update.message.reply_video(video=vf, caption=caption)
 
         await status_msg.delete()
 
