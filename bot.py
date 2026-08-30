@@ -340,6 +340,49 @@ def run_ytdlp_download(url: str, download_path: Path, is_carousel: bool, is_x: b
         raise ValueError("yt-dlp not found.")
 
 
+def get_tiktok_image_urls(url: str) -> list:
+    """Use --dump-single-json to get TikTok image post metadata."""
+    cmd = [
+        "yt-dlp",
+        "--dump-single-json",
+        "--no-download",
+        "--no-warnings",
+        "--no-check-certificates",
+        "--no-playlist",
+    ] + get_cookie_args() + [url]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.stdout.strip():
+            try:
+                data = json.loads(result.stdout.strip())
+            except json.JSONDecodeError:
+                logger.error(f"TikTok JSON parse error: {result.stdout.strip()[:500]}")
+                return []
+            if isinstance(data, dict):
+                logger.info(f"TikTok JSON top keys: {list(data.keys())[:20]}")
+                urls = collect_image_urls(data)
+                if urls:
+                    logger.info(f"TikTok JSON: {len(urls)} image URL(s)")
+                    return urls
+                for key in ["images", "image_urls", "image_list"]:
+                    val = data.get(key)
+                    if isinstance(val, list):
+                        for item in val:
+                            if isinstance(item, str) and item.startswith("http"):
+                                urls.append(item)
+                            elif isinstance(item, dict):
+                                for uk in ["url", "src", "download_url"]:
+                                    if uk in item and isinstance(item[uk], str):
+                                        urls.append(item[uk])
+                                        break
+                urls = list(dict.fromkeys(urls))
+                logger.info(f"TikTok fallback: {len(urls)} image URL(s)")
+                return urls
+    except Exception as e:
+        logger.error(f"TikTok JSON fetch failed: {e}")
+    return []
+
+
 def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: int, app: Application) -> tuple[dict, list]:
     downloaded_files = []
     before_files = set(f.name for f in download_path.iterdir() if f.is_file())
@@ -392,12 +435,22 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
             continue
     logger.info(f"All info files: {len(all_image_urls)} image URL(s) total")
 
+    is_tiktok = "tiktok.com" in url_lower or "vm.tiktok.com" in url_lower
+
     if is_carousel and not all_image_urls:
         carousel_urls = get_carousel_image_urls(url)
         for u in carousel_urls:
             if u not in all_image_urls:
                 all_image_urls.append(u)
         logger.info(f"After carousel fetch: {len(all_image_urls)} image URL(s)")
+
+    if is_tiktok and not all_image_urls:
+        logger.info("TikTok: no images from info files, trying --dump-single-json")
+        tiktok_urls = get_tiktok_image_urls(url)
+        for u in tiktok_urls:
+            if u not in all_image_urls:
+                all_image_urls.append(u)
+        logger.info(f"After TikTok fetch: {len(all_image_urls)} image URL(s)")
 
     image_urls = all_image_urls
     logger.info(f"Final image URL(s): {len(image_urls)}")
