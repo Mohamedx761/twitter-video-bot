@@ -501,14 +501,13 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
                     "1. الكوكيز ممكن تكون منتهية — اعمل Export جديد وابعته بـ /cookies\n"
                     "2. حدّث yt-dlp لآخر إصدار: pip install -U yt-dlp"
                 )
+            tail = (last_stderr or "").strip().splitlines()
+            hint = tail[-1] if tail else ""
             raise ValueError(
-                "التحميل من غير تسجيل دخول فشل — ممكن البوست يكون خاص أو فيه تقييد.\n\n"
-                "لو البوست عام وطبيعي جرب تاني بعد شوية.\n"
-                "لو المشكلة مستمرة، ضيف كوكيز:\n"
-                "1. فتح x.com من المتصفح في التليفون\n"
-                "2. نزّل اضافة \"Get cookies.txt\" من متجر المتصفح\n"
-                "3. ادخل x.com واعمل Export للـ cookies\n"
-                "4. ابعت ملف cookies.txt للبوت بالأمر /cookies"
+                f"التحميل من X فشل.\n\n"
+                f"سبب yt-dlp: {hint[:200]}\n\n"
+                "لو البوست عام وطبيعي، جرب تاني بعد شوية.\n"
+                "لو المشكلة مستمرة، ابعت كوكيز بالأمر /cookies"
             )
         raise ValueError("No media found in this post. The post may be private or require login.")
 
