@@ -26,7 +26,7 @@ COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip().strip('"').strip("'")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 def get_cookie_args() -> list:
-    if COOKIES_FILE:
+    if COOKIES_FILE and Path(COOKIES_FILE).exists():
         return ["--cookie-file", COOKIES_FILE]
     return []
 
@@ -45,23 +45,38 @@ def is_authorized(user_id: int) -> bool:
     return user_id == AUTHORIZED_USER_ID
 
 
+URL_PATTERNS = [
+    r"(https?://)?(www\.)?(x\.com|twitter\.com)/\S+/status/\d+",
+    r"(https?://)?(www\.)?(instagram\.com)/(p|reel|tv|stories)/\S+",
+    r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/.*/(videos|posts)/\S+",
+    r"(https?://)?fb\.watch/\S+",
+    r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/reel/\S+",
+    r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/share/\S+",
+    r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/permalink\.php\S*",
+    r"(https?://)?vm\.tiktok\.com/\S+",
+    r"(https?://)?(www\.)?tiktok\.com/@\S+/video/\d+",
+]
+
+
+def extract_url(text: str) -> str:
+    """Find the first supported link anywhere inside the message text
+    (not just when the whole message is a bare URL), and return a clean
+    URL string usable by yt-dlp."""
+    text = text.strip()
+    for pattern in URL_PATTERNS:
+        match = re.search(pattern, text)
+        if match:
+            url = match.group(0)
+            # Trim trailing punctuation that's likely not part of the URL
+            url = url.rstrip(".,!?;:)>]\"'")
+            if not url.lower().startswith("http"):
+                url = "https://" + url
+            return url
+    return None
+
+
 def is_valid_url(url: str) -> bool:
-    url = url.strip()
-    patterns = [
-        r"(https?://)?(www\.)?(x\.com|twitter\.com)/\S+/status/\d+",
-        r"(https?://)?(www\.)?(instagram\.com)/(p|reel|tv|stories)/\S+",
-        r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/.*/(videos|posts)/\S+",
-        r"(https?://)?fb\.watch/\S+",
-        r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/reel/\S+",
-        r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/share/\S+",
-        r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/permalink\.php",
-        r"(https?://)?vm\.tiktok\.com/\S+",
-        r"(https?://)?(www\.)?tiktok\.com/@\S+/video/\d+",
-    ]
-    for pattern in patterns:
-        if re.match(pattern, url):
-            return True
-    return False
+    return extract_url(url) is not None
 
 
 def make_progress_bar(percent: int) -> str:
@@ -127,6 +142,19 @@ def get_json_info(url: str) -> dict:
     return {}
 
 
+def _best_str_url(value):
+    """TikTok (and some other extractors) give image URLs as a list of
+    quality/CDN variants instead of a single string. Pick the last one
+    that looks like a usable URL."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        for item in reversed(value):
+            if isinstance(item, str) and item.startswith("http"):
+                return item
+    return None
+
+
 def collect_image_urls(info: dict) -> list:
     primary = []
     fallback = []
@@ -135,22 +163,31 @@ def collect_image_urls(info: dict) -> list:
         if isinstance(obj, dict):
             for k, v in obj.items():
                 if k == "display_resources" and isinstance(v, list):
-                    # Multiple resolutions of the same image; keep only the last (highest res)
                     r = v[-1]
                     if isinstance(r, dict) and r.get("src"):
                         primary.append(r["src"])
                 elif k == "images" and isinstance(v, list):
                     for im in v:
-                        if isinstance(im, dict) and im.get("url"):
-                            primary.append(im["url"])
+                        if isinstance(im, dict) and im.get("url") is not None:
+                            u = _best_str_url(im["url"])
+                            if u:
+                                primary.append(u)
                 elif k == "thumbnails" and isinstance(v, list):
                     t = v[-1]
                     if isinstance(t, dict) and t.get("url"):
-                        primary.append(t["url"])
+                        u = _best_str_url(t["url"])
+                        if u:
+                            primary.append(u)
                 elif k == "thumbnail" and isinstance(v, str) and v.startswith("http"):
                     fallback.append(v)
                 elif k == "url" and isinstance(v, str) and re.search(r"\.(jpg|jpeg|png|webp|gif)(\?|$)", v, re.I):
                     primary.append(v)
+                elif k == "url" and isinstance(v, list):
+                    u = _best_str_url(v)
+                    if u and re.search(r"\.(jpg|jpeg|png|webp|gif)(\?|$)", u, re.I):
+                        primary.append(u)
+                    else:
+                        walk(v)
                 else:
                     walk(v)
         elif isinstance(obj, list):
@@ -272,6 +309,37 @@ def get_carousel_image_urls(url: str) -> list:
     return []
 
 
+def run_ytdlp_download(url: str, download_path: Path, is_carousel: bool, is_x: bool, use_cookies: bool) -> str:
+    """Run one yt-dlp download attempt. Returns stderr text for diagnostics."""
+    cmd_dl = [
+        "yt-dlp",
+        "--no-warnings",
+        "--no-check-certificates",
+        "--ignore-no-formats-error",
+        "--write-info-json",
+        "--no-overwrites",
+    ]
+    if use_cookies:
+        cmd_dl += get_cookie_args()
+    cmd_dl += ["-o", str(download_path / "%(autonumber)s_%(id)s.%(ext)s")]
+    if is_x:
+        cmd_dl.append("--verbose")
+    if not is_carousel:
+        cmd_dl.append("--no-playlist")
+    cmd_dl.append(url)
+
+    try:
+        proc = subprocess.run(cmd_dl, capture_output=True, text=True, timeout=600)
+        stderr = proc.stderr or ""
+        if stderr.strip():
+            logger.error(f"yt-dlp stderr (cookies={use_cookies}): {stderr.strip()[:1000]}")
+        return stderr
+    except subprocess.TimeoutExpired:
+        raise ValueError("Download timed out (10 min limit).")
+    except FileNotFoundError:
+        raise ValueError("yt-dlp not found.")
+
+
 def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: int, app: Application) -> tuple[dict, list]:
     downloaded_files = []
     before_files = set(f.name for f in download_path.iterdir() if f.is_file())
@@ -290,34 +358,19 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
     )
     is_x = "twitter.com" in url_lower or "x.com" in url_lower
 
-    if COOKIES_FILE and not Path(COOKIES_FILE).exists():
-        logger.warning(f"COOKIES_FILE '{COOKIES_FILE}' does not exist — X/Instagram may need cookies")
+    have_cookies_file = bool(COOKIES_FILE) and Path(COOKIES_FILE).exists()
 
     if is_x:
-        logger.info("X/Twitter detected — may require cookies/authentication")
-
-    cmd_dl = [
-        "yt-dlp",
-        "--no-warnings",
-        "--no-check-certificates",
-        "--ignore-no-formats-error",
-        "--write-info-json",
-        "--no-overwrites",
-    ] + get_cookie_args() + [
-        "-o", str(download_path / "%(autonumber)s_%(id)s.%(ext)s"),
-    ]
-    if not is_carousel:
-        cmd_dl.append("--no-playlist")
-    cmd_dl.append(url)
-
-    try:
-        proc = subprocess.run(cmd_dl, capture_output=True, text=True, timeout=600)
-        if proc.stderr.strip():
-            logger.error(f"yt-dlp stderr: {proc.stderr.strip()[:1000]}")
-    except subprocess.TimeoutExpired:
-        raise ValueError("Download timed out (10 min limit).")
-    except FileNotFoundError:
-        raise ValueError("yt-dlp not found.")
+        logger.info("X/Twitter: attempting without cookies first")
+        last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=False)
+        got_something = bool(list(download_path.glob("*.info.json"))) or bool(
+            set(f.name for f in download_path.iterdir() if f.is_file()) - before_files
+        )
+        if not got_something and have_cookies_file:
+            logger.info("X/Twitter: no-cookies attempt failed, retrying with cookies")
+            last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=True)
+    else:
+        last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=True)
 
     all_image_urls = []
     info = {}
@@ -385,14 +438,24 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
 
     if not downloaded_files:
         if is_x:
+            if have_cookies_file:
+                tail = (last_stderr or "").strip().splitlines()
+                hint = tail[-1] if tail else ""
+                raise ValueError(
+                    "فشل التحميل من X حتى مع الكوكيز.\n\n"
+                    f"السبب المحتمل: {hint[:200]}\n\n"
+                    "جرب:\n"
+                    "1. الكوكيز ممكن تكون منتهية — اعمل Export جديد وابعته بـ /cookies\n"
+                    "2. حدّث yt-dlp لآخر إصدار: pip install -U yt-dlp"
+                )
             raise ValueError(
-                "X/Twitter requires cookies to download.\n\n"
-                "جرب الحل ده:\n"
+                "التحميل من غير تسجيل دخول فشل — ممكن البوست يكون خاص أو فيه تقييد.\n\n"
+                "لو البوست عام وطبيعي جرب تاني بعد شوية.\n"
+                "لو المشكلة مستمرة، ضيف كوكيز:\n"
                 "1. فتح x.com من المتصفح في التليفون\n"
                 "2. نزّل اضافة \"Get cookies.txt\" من متجر المتصفح\n"
                 "3. ادخل x.com واعمل Export للـ cookies\n"
-                "4. ابعت ملف cookies.txt للبوت بالأمر /cookies\n\n"
-                "أو ابعت ملف cookies.txt كملحق مع الأمر /cookies"
+                "4. ابعت ملف cookies.txt للبوت بالأمر /cookies"
             )
         raise ValueError("No media found in this post. The post may be private or require login.")
 
@@ -434,7 +497,10 @@ async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cookies_path = COOKIES_FILE if COOKIES_FILE else "cookies.txt"
         try:
             file = await context.bot.get_file(file_id)
-            await file.download(cookies_path)
+            if hasattr(file, "download_to_drive"):
+                await file.download_to_drive(cookies_path)
+            else:
+                await file.download(cookies_path)
             COOKIES_FILE = cookies_path
             await update.message.reply_text(
                 "✅ Cookies uploaded successfully!\n"
@@ -469,8 +535,8 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start(update, context)
         return
 
-    url = text
-    if not is_valid_url(url):
+    url = extract_url(text)
+    if not url:
         await update.message.reply_text(
             "Please send a valid link.\n\n"
             "Supported:\n"
@@ -509,44 +575,30 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photos = [fp for fp in file_paths if fp.lower().endswith(IMAGE_EXTS)]
         videos = [fp for fp in file_paths if fp.lower().endswith(VIDEO_EXTS)]
 
-        if photos:
-            caption = (info or {}).get("description", "") or (info or {}).get("title", "") or ""
-            for i in range(0, len(photos), 10):
-                group = photos[i:i+10]
-                media = []
-                files = []
-                for photo_path in group:
-                    if not os.path.exists(photo_path):
-                        continue
-                    fp_size = os.path.getsize(photo_path) / (1024 * 1024)
-                    use_path = photo_path
-                    if fp_size > 10:
-                        await status_msg.edit_text("Photo too large, compressing...")
-                        cpath = str(photo_path) + ".compressed.jpg"
-                        await loop.run_in_executor(None, lambda p=str(photo_path), c=str(cpath): subprocess.run([
-                            "ffmpeg", "-i", p, "-vf", "scale=min(1280,iw):-2",
-                            "-q:v", "2", c, "-y"
-                        ]))
-                        if os.path.exists(cpath) and os.path.getsize(cpath) < 10 * 1024 * 1024:
-                            use_path = cpath
-                    fname = Path(use_path).name
-                    input_file = InputFile(str(use_path))
-                    files.append(input_file)
-                    media.append(InputMediaPhoto(media=f"attach://{fname}", caption=caption))
-                try:
-                    await context.bot.send_media_group(chat_id=chat_id, media=media, files=files)
-                    logger.info(f"send_media_group sent {len(group)} photo(s)")
-                except Exception as e:
-                    logger.error(f"send_media_group failed: {e}, falling back to individual sends")
-                    for photo_path in group:
-                        if os.path.exists(photo_path):
-                            with open(photo_path, "rb") as pf:
-                                await update.message.reply_photo(photo=pf, caption=caption)
+        prepared_items = []
+        oversized_documents = []
+
+        for photo_path in photos:
+            if not os.path.exists(photo_path):
+                continue
+            fp_size = os.path.getsize(photo_path) / (1024 * 1024)
+            use_path = photo_path
+            if fp_size > 10:
+                await status_msg.edit_text("Photo too large, compressing...")
+                cpath = str(photo_path) + ".compressed.jpg"
+                await loop.run_in_executor(None, lambda p=str(photo_path), c=str(cpath): subprocess.run([
+                    "ffmpeg", "-i", p, "-vf", "scale=min(1280,iw):-2",
+                    "-q:v", "2", c, "-y"
+                ]))
+                if os.path.exists(cpath) and os.path.getsize(cpath) < 10 * 1024 * 1024:
+                    use_path = cpath
+            prepared_items.append((use_path, "photo"))
 
         for video_path in videos:
             if not os.path.exists(video_path):
                 continue
             file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+            use_path = video_path
             if file_size_mb > 50:
                 await status_msg.edit_text(f"Video is {file_size_mb:.1f}MB. Compressing...")
                 cpath = str(video_path) + ".compressed.mp4"
@@ -556,14 +608,52 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "-movflags", "+faststart", c, "-y"
                 ]))
                 if os.path.exists(cpath) and os.path.getsize(cpath) < 50 * 1024 * 1024:
-                    video_path = cpath
+                    use_path = cpath
                 else:
-                    with open(video_path, "rb") as f:
-                        await update.message.reply_document(document=f, caption=caption)
-                    os.remove(video_path)
+                    oversized_documents.append(video_path)
                     continue
-            with open(video_path, "rb") as vf:
-                await update.message.reply_video(video=vf, caption=caption)
+            prepared_items.append((use_path, "video"))
+
+        await status_msg.edit_text(f"Uploading {len(prepared_items) + len(oversized_documents)} file(s)...")
+
+        for i in range(0, len(prepared_items), 10):
+            group = prepared_items[i:i + 10]
+
+            if len(group) == 1:
+                path, kind = group[0]
+                with open(path, "rb") as f:
+                    if kind == "photo":
+                        await update.message.reply_photo(photo=f, caption=caption)
+                    else:
+                        await update.message.reply_video(video=f, caption=caption)
+                continue
+
+            media = []
+            files = []
+            for idx, (path, kind) in enumerate(group):
+                fname = Path(path).name
+                files.append(InputFile(str(path)))
+                item_caption = caption if (i == 0 and idx == 0) else None
+                if kind == "photo":
+                    media.append(InputMediaPhoto(media=f"attach://{fname}", caption=item_caption))
+                else:
+                    media.append(InputMediaVideo(media=f"attach://{fname}", caption=item_caption))
+            try:
+                await context.bot.send_media_group(chat_id=chat_id, media=media, files=files)
+                logger.info(f"send_media_group sent {len(group)} item(s)")
+            except Exception as e:
+                logger.error(f"send_media_group failed: {e}, falling back to individual sends")
+                for path, kind in group:
+                    with open(path, "rb") as f:
+                        if kind == "photo":
+                            await update.message.reply_photo(photo=f, caption=caption)
+                        else:
+                            await update.message.reply_video(video=f, caption=caption)
+
+        for video_path in oversized_documents:
+            with open(video_path, "rb") as f:
+                await update.message.reply_document(document=f, caption=caption)
+            os.remove(video_path)
 
         await status_msg.delete()
 
