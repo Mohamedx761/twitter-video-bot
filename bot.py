@@ -349,6 +349,7 @@ def get_tiktok_image_urls(url: str) -> list:
         "--no-warnings",
         "--no-check-certificates",
         "--no-playlist",
+        "--ignore-no-formats-error",
     ] + get_cookie_args() + [url]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -391,9 +392,14 @@ def get_x_image_urls(url: str) -> list:
         "--no-download",
         "--no-warnings",
         "--no-check-certificates",
+        "--ignore-no-formats-error",
     ] + get_cookie_args() + [url]
     try:
+        logger.info(f"X image fetch: running yt-dlp --dump-single-json for {url}")
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        logger.info(f"X image fetch: returncode={result.returncode}, stdout_len={len(result.stdout or '')}, stderr_len={len(result.stderr or '')}")
+        if result.stderr:
+            logger.error(f"X image fetch stderr: {result.stderr.strip()[:500]}")
         if result.stdout.strip():
             try:
                 data = json.loads(result.stdout.strip())
@@ -406,20 +412,24 @@ def get_x_image_urls(url: str) -> list:
                 if urls:
                     logger.info(f"X JSON: {len(urls)} image URL(s)")
                     return urls
-                for key in ["photos", "images", "media_details"]:
+                for key in ["photos", "images", "media_details", "extended_entities"]:
                     val = data.get(key)
+                    if isinstance(val, dict):
+                        val = val.get("media", [])
                     if isinstance(val, list):
                         for item in val:
                             if isinstance(item, str) and item.startswith("http"):
                                 urls.append(item)
                             elif isinstance(item, dict):
-                                for uk in ["url", "src", "media_url_https", "original_url"]:
+                                for uk in ["url", "src", "media_url_https", "original_url", "media_url"]:
                                     if uk in item and isinstance(item[uk], str) and item[uk].startswith("http"):
                                         urls.append(item[uk])
                                         break
                 urls = list(dict.fromkeys(urls))
                 logger.info(f"X fallback: {len(urls)} image URL(s)")
                 return urls
+        else:
+            logger.warning("X image fetch: no stdout output")
     except Exception as e:
         logger.error(f"X JSON fetch failed: {e}")
     return []
