@@ -323,7 +323,7 @@ def run_ytdlp_download(url: str, download_path: Path, is_carousel: bool, is_x: b
         cmd_dl += get_cookie_args()
     cmd_dl += ["-o", str(download_path / "%(autonumber)s_%(id)s.%(ext)s")]
     if is_x:
-        cmd_dl.append("--verbose")
+        cmd_dl += ["--verbose", "--write-thumbnail"]
     if not is_carousel:
         cmd_dl.append("--no-playlist")
     cmd_dl.append(url)
@@ -393,6 +393,8 @@ def get_x_image_urls(url: str) -> list:
         "--no-warnings",
         "--no-check-certificates",
         "--ignore-no-formats-error",
+        "--extractor-retries", "3",
+        "--retry-sleep", "1",
     ] + get_cookie_args() + [url]
     try:
         logger.info(f"X image fetch: running yt-dlp --dump-single-json for {url}")
@@ -407,12 +409,27 @@ def get_x_image_urls(url: str) -> list:
                 logger.error(f"X JSON parse error: {result.stdout.strip()[:500]}")
                 return []
             if isinstance(data, dict):
-                logger.info(f"X JSON top keys: {list(data.keys())[:20]}")
+                all_keys = list(data.keys())[:30]
+                logger.info(f"X JSON top keys: {all_keys}")
                 urls = collect_image_urls(data)
                 if urls:
-                    logger.info(f"X JSON: {len(urls)} image URL(s)")
+                    logger.info(f"X JSON via collect_image_urls: {len(urls)} image URL(s)")
                     return urls
-                for key in ["photos", "images", "media_details", "extended_entities"]:
+
+                entries = data.get("entries")
+                if isinstance(entries, list):
+                    for idx, entry in enumerate(entries):
+                        if not isinstance(entry, dict):
+                            continue
+                        logger.info(f"X entry {idx} keys: {list(entry.keys())[:20]}")
+                        entry_urls = collect_image_urls(entry)
+                        if entry_urls:
+                            logger.info(f"X entry {idx}: {len(entry_urls)} image URL(s)")
+                            urls.extend(entry_urls)
+                    if urls:
+                        return list(dict.fromkeys(urls))
+
+                for key in ["photos", "images", "media_details", "extended_entities", "media"]:
                     val = data.get(key)
                     if isinstance(val, dict):
                         val = val.get("media", [])
@@ -425,8 +442,25 @@ def get_x_image_urls(url: str) -> list:
                                     if uk in item and isinstance(item[uk], str) and item[uk].startswith("http"):
                                         urls.append(item[uk])
                                         break
+
+                if not urls:
+                    logger.info("X: deep recursive search for any URLs in JSON")
+                    def _deep_find(obj, depth=0):
+                        if depth > 12:
+                            return
+                        if isinstance(obj, dict):
+                            for k, v in obj.items():
+                                if k in ("url", "media_url", "media_url_https", "original_url", "src") and isinstance(v, str) and v.startswith("http"):
+                                    if re.search(r"\.(jpg|jpeg|png|webp|gif)(\?|$)", v, re.I):
+                                        urls.append(v)
+                                _deep_find(v, depth + 1)
+                        elif isinstance(obj, list):
+                            for item in obj:
+                                _deep_find(item, depth + 1)
+                    _deep_find(data)
+
                 urls = list(dict.fromkeys(urls))
-                logger.info(f"X fallback: {len(urls)} image URL(s)")
+                logger.info(f"X final: {len(urls)} image URL(s)")
                 return urls
         else:
             logger.warning("X image fetch: no stdout output")
@@ -454,6 +488,7 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
     is_x = "twitter.com" in url_lower or "x.com" in url_lower
 
     have_cookies_file = bool(COOKIES_FILE) and Path(COOKIES_FILE).exists()
+    logger.info(f"Cookies: COOKIES_FILE={COOKIES_FILE!r}, exists={have_cookies_file}")
 
     if is_x:
         logger.info("X/Twitter: attempting without cookies first")
