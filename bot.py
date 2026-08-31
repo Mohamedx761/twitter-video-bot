@@ -111,17 +111,20 @@ IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.gif', '.webp')
 
 
 def dedupe_thumbnails(file_paths):
-    groups = {}
-    for fp in file_paths:
-        p = Path(fp)
-        groups.setdefault(p.stem, []).append(fp)
-    result = []
-    for stem, files in groups.items():
-        has_video = any(Path(f).suffix.lower() in VIDEO_EXTS for f in files)
-        for f in files:
-            if has_video and Path(f).suffix.lower() in IMAGE_EXTS:
-                continue
-            result.append(f)
+    videos = [fp for fp in file_paths if Path(fp).suffix.lower() in VIDEO_EXTS]
+    images = [fp for fp in file_paths if Path(fp).suffix.lower() in IMAGE_EXTS]
+    if not videos:
+        return file_paths
+    video_stems = {Path(v).stem for v in videos}
+    result = list(videos)
+    for img in images:
+        img_stem = Path(img).stem
+        is_thumb = any(
+            img_stem == vs or img_stem.startswith(vs + ".") or img_stem.startswith(vs + "_") or vs.startswith(img_stem + ".") or vs.startswith(img_stem + "_")
+            for vs in video_stems
+        )
+        if not is_thumb:
+            result.append(img)
     return result
 
 
@@ -339,7 +342,6 @@ def run_ytdlp_download(url: str, download_path: Path, is_carousel: bool, is_x: b
     if is_x:
         cmd_dl += [
             "--verbose",
-            "--write-thumbnail",
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "--legacy-server-connect",
         ]
