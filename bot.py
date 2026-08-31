@@ -488,11 +488,9 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
         try:
             with open(f) as fp:
                 data = json.load(fp)
-                urls = collect_image_urls(data)
-                all_image_urls.extend(urls)
                 if not info:
                     info = data
-                logger.info(f"Info file {f.name}: {len(urls)} image URL(s), keys={list(data.keys())[:10]}")
+                logger.info(f"Info file {f.name}: keys={list(data.keys())[:15]}")
                 try:
                     f.unlink()
                 except Exception:
@@ -500,7 +498,7 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
         except Exception as e:
             logger.error(f"Failed to read info file {f.name}: {e}")
             continue
-    logger.info(f"All info files: {len(all_image_urls)} image URL(s) total")
+    logger.info(f"All info files parsed")
 
     is_tiktok = "tiktok.com" in url_lower or "vm.tiktok.com" in url_lower
 
@@ -758,8 +756,13 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await safe_edit(status_msg, f"Video is {file_size_mb:.1f}MB. Compressing...")
                 cpath = str(video_path) + ".compressed.mp4"
                 try:
-                    await loop.run_in_executor(None, lambda v=str(video_path), c=str(cpath): subprocess.run([
-                        "ffmpeg", "-i", v, "-c:v", "libx264", "-crf", "28",
+                    crf = 28
+                    if file_size_mb > 200:
+                        crf = 32
+                    if file_size_mb > 500:
+                        crf = 35
+                    await loop.run_in_executor(None, lambda v=str(video_path), c=str(cpath), r=crf: subprocess.run([
+                        "ffmpeg", "-i", v, "-c:v", "libx264", "-crf", str(r),
                         "-vf", "scale=min(1280,iw):-2", "-c:a", "aac", "-b:a", "128k",
                         "-movflags", "+faststart", c, "-y"
                     ]))
