@@ -5,6 +5,7 @@ import re
 import subprocess
 import json
 import hashlib
+import urllib.request
 from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, InputMediaVideo, InputFile
@@ -398,87 +399,45 @@ def get_tiktok_image_urls(url: str) -> list:
 
 
 def get_x_image_urls(url: str) -> list:
-    """Use --dump-single-json to get X/Twitter image post metadata."""
-    cmd = [
-        "yt-dlp",
-        "--dump-single-json",
-        "--no-download",
-        "--no-warnings",
-        "--no-check-certificates",
-        "--ignore-no-formats-error",
-        "--extractor-retries", "3",
-        "--retry-sleep", "1",
-    ] + get_cookie_args() + [url]
+    """Use Twitter syndication API to get image URLs from image-only posts."""
+    tweet_id_match = re.search(r"/status/(\d+)", url)
+    if not tweet_id_match:
+        logger.error(f"X image fetch: cannot extract tweet ID from {url}")
+        return []
+    tweet_id = tweet_id_match.group(1)
+
+    syndication_url = f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&token=x"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA",
+    }
+
     try:
-        logger.info(f"X image fetch: running yt-dlp --dump-single-json for {url}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        logger.info(f"X image fetch: returncode={result.returncode}, stdout_len={len(result.stdout or '')}, stderr_len={len(result.stderr or '')}")
-        if result.stderr:
-            logger.error(f"X image fetch stderr: {result.stderr.strip()[:500]}")
-        if result.stdout.strip():
-            try:
-                data = json.loads(result.stdout.strip())
-            except json.JSONDecodeError:
-                logger.error(f"X JSON parse error: {result.stdout.strip()[:500]}")
-                return []
-            if isinstance(data, dict):
-                all_keys = list(data.keys())[:30]
-                logger.info(f"X JSON top keys: {all_keys}")
-                urls = collect_image_urls(data)
-                if urls:
-                    logger.info(f"X JSON via collect_image_urls: {len(urls)} image URL(s)")
-                    return urls
+        logger.info(f"X image fetch: syndication API for tweet {tweet_id}")
+        req = urllib.request.Request(syndication_url, headers=headers)
+        resp = urllib.request.urlopen(req, timeout=15)
+        data = json.loads(resp.read())
 
-                entries = data.get("entries")
-                if isinstance(entries, list):
-                    for idx, entry in enumerate(entries):
-                        if not isinstance(entry, dict):
-                            continue
-                        logger.info(f"X entry {idx} keys: {list(entry.keys())[:20]}")
-                        entry_urls = collect_image_urls(entry)
-                        if entry_urls:
-                            logger.info(f"X entry {idx}: {len(entry_urls)} image URL(s)")
-                            urls.extend(entry_urls)
-                    if urls:
-                        return list(dict.fromkeys(urls))
+        urls = []
+        for media in data.get("mediaDetails", []):
+            if media.get("type") == "photo":
+                media_url = media.get("media_url_https", "")
+                if media_url:
+                    urls.append(media_url)
 
-                for key in ["photos", "images", "media_details", "extended_entities", "media"]:
-                    val = data.get(key)
-                    if isinstance(val, dict):
-                        val = val.get("media", [])
-                    if isinstance(val, list):
-                        for item in val:
-                            if isinstance(item, str) and item.startswith("http"):
-                                urls.append(item)
-                            elif isinstance(item, dict):
-                                for uk in ["url", "src", "media_url_https", "original_url", "media_url"]:
-                                    if uk in item and isinstance(item[uk], str) and item[uk].startswith("http"):
-                                        urls.append(item[uk])
-                                        break
+        if not urls:
+            for media in data.get("mediaDetails", []):
+                for key in ["media_url_https", "media_url", "url"]:
+                    val = media.get(key, "")
+                    if isinstance(val, str) and val.startswith("http"):
+                        urls.append(val)
+                        break
 
-                if not urls:
-                    logger.info("X: deep recursive search for any URLs in JSON")
-                    def _deep_find(obj, depth=0):
-                        if depth > 12:
-                            return
-                        if isinstance(obj, dict):
-                            for k, v in obj.items():
-                                if k in ("url", "media_url", "media_url_https", "original_url", "src") and isinstance(v, str) and v.startswith("http"):
-                                    if re.search(r"\.(jpg|jpeg|png|webp|gif)(\?|$)", v, re.I):
-                                        urls.append(v)
-                                _deep_find(v, depth + 1)
-                        elif isinstance(obj, list):
-                            for item in obj:
-                                _deep_find(item, depth + 1)
-                    _deep_find(data)
-
-                urls = list(dict.fromkeys(urls))
-                logger.info(f"X final: {len(urls)} image URL(s)")
-                return urls
-        else:
-            logger.warning("X image fetch: no stdout output")
+        urls = list(dict.fromkeys(urls))
+        logger.info(f"X image fetch: {len(urls)} image URL(s) from syndication API")
+        return urls
     except Exception as e:
-        logger.error(f"X JSON fetch failed: {e}")
+        logger.error(f"X image fetch syndication API failed: {e}")
     return []
 
 
