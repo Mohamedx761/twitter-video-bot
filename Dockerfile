@@ -1,17 +1,17 @@
 FROM aiogram/telegram-bot-api:latest AS api-server
 
-FROM python:3.11-alpine
+FROM python:3.11-slim-bookworm
 
-RUN apk add --no-cache openssl ca-certificates
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libstdc++6 libgcc-s1 openssl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY --from=api-server /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN apk add --no-cache gcc musl-dev libffi-dev && \
-    pip install --no-cache-dir -r requirements.txt && \
-    apk del gcc musl-dev libffi-dev
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
 COPY start.sh .
