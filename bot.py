@@ -752,17 +752,12 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
             file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
             use_path = video_path
-            if file_size_mb > 50:
+            if file_size_mb > 500:
                 await safe_edit(status_msg, f"Video is {file_size_mb:.1f}MB. Compressing...")
                 cpath = str(video_path) + ".compressed.mp4"
                 try:
-                    crf = 28
-                    if file_size_mb > 200:
-                        crf = 32
-                    if file_size_mb > 500:
-                        crf = 35
-                    await loop.run_in_executor(None, lambda v=str(video_path), c=str(cpath), r=crf: subprocess.run([
-                        "ffmpeg", "-i", v, "-c:v", "libx264", "-crf", str(r),
+                    await loop.run_in_executor(None, lambda v=str(video_path), c=str(cpath): subprocess.run([
+                        "ffmpeg", "-i", v, "-c:v", "libx264", "-crf", "35",
                         "-vf", "scale=min(1280,iw):-2", "-c:a", "aac", "-b:a", "128k",
                         "-movflags", "+faststart", c, "-y"
                     ]))
@@ -773,9 +768,11 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         continue
                 except FileNotFoundError:
                     logger.warning("ffmpeg not found, sending original video")
-                    if file_size_mb > 50:
-                        oversized_documents.append(video_path)
-                        continue
+                    oversized_documents.append(video_path)
+                    continue
+            elif file_size_mb > 50:
+                oversized_documents.append(video_path)
+                continue
             prepared_items.append((use_path, "video"))
 
         await safe_edit(status_msg, f"Uploading {len(prepared_items) + len(oversized_documents)} file(s)...")
