@@ -662,13 +662,36 @@ async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(
             "Send me your cookies.txt file.\n\n"
-            "ابعتلي ملف cookies.txt بتاعك.\n\n"
-            "How to get cookies:\n"
-            "1. Install 'Get cookies.txt' extension on your phone browser\n"
-            "2. Visit x.com\n"
-            "3. Tap the extension → Export\n"
-            "4. Send the cookies.txt file here with /cookies command"
+            "ابعتلي ملف cookies.txt بتاعك."
         )
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Any file sent to the bot is treated as cookies upload."""
+    global COOKIES_FILE
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Bot is for personal use only.")
+        return
+    if update.message.document:
+        file_id = update.message.document.file_id
+        cookies_path = COOKIES_FILE if COOKIES_FILE else "cookies.txt"
+        try:
+            file = await context.bot.get_file(file_id)
+            if hasattr(file, "download_to_drive"):
+                await file.download_to_drive(cookies_path)
+            else:
+                await file.download(cookies_path)
+            COOKIES_FILE = cookies_path
+            await update.message.reply_text(
+                "✅ Cookies uploaded successfully!\n"
+                "Now try sending an X/Twitter link again.\n\n"
+                "✅ ملف الكوكيز اتحمل بنجاح!\n"
+                "جرب ابعت لنك اكس تاني الحين."
+            )
+            logger.info("Cookies file uploaded successfully via document handler")
+        except Exception as e:
+            logger.error(f"Failed to upload cookies: {e}")
+            await update.message.reply_text(f"Failed to upload cookies: {e}")
 
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -829,6 +852,7 @@ def main():
     application.add_handler(CommandHandler("help", start))
     application.add_handler(CommandHandler("cookies", cookies_command))
     application.add_handler(CallbackQueryHandler(cancel_button))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
 
     logger.info("Bot started")
