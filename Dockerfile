@@ -17,4 +17,4 @@ ENV TELEGRAM_API_PORT=8081
 
 EXPOSE 8081
 
-CMD ["./start.sh"]
+ENTRYPOINT ["./start.sh"]
