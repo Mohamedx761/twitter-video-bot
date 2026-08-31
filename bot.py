@@ -331,7 +331,12 @@ def run_ytdlp_download(url: str, download_path: Path, is_carousel: bool, is_x: b
         cmd_dl += get_cookie_args()
     cmd_dl += ["-o", str(download_path / "%(autonumber)s_%(id)s.%(ext)s")]
     if is_x:
-        cmd_dl += ["--verbose", "--write-thumbnail"]
+        cmd_dl += [
+            "--verbose",
+            "--write-thumbnail",
+            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "--legacy-server-connect",
+        ]
     if not is_carousel:
         cmd_dl.append("--no-playlist")
     cmd_dl.append(url)
