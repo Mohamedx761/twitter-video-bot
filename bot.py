@@ -31,7 +31,7 @@ def get_cookie_args() -> list:
     paths = [COOKIES_FILE, "cookies.txt"] if COOKIES_FILE else ["cookies.txt"]
     for p in paths:
         if p and Path(p).exists():
-            return ["--cookie-file", p]
+            return ["--cookies", p]
     return []
 
 logging.basicConfig(
