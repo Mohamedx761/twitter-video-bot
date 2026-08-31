@@ -28,8 +28,10 @@ COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip().strip('"').strip("'")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 def get_cookie_args() -> list:
-    if COOKIES_FILE and Path(COOKIES_FILE).exists():
-        return ["--cookie-file", COOKIES_FILE]
+    paths = [COOKIES_FILE, "cookies.txt"] if COOKIES_FILE else ["cookies.txt"]
+    for p in paths:
+        if p and Path(p).exists():
+            return ["--cookie-file", p]
     return []
 
 logging.basicConfig(
@@ -464,7 +466,8 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
     )
     is_x = "twitter.com" in url_lower or "x.com" in url_lower
 
-    have_cookies_file = bool(COOKIES_FILE) and Path(COOKIES_FILE).exists()
+    _cookie_paths = [COOKIES_FILE, "cookies.txt"] if COOKIES_FILE else ["cookies.txt"]
+    have_cookies_file = any(Path(p).exists() for p in _cookie_paths if p)
     logger.info(f"Cookies: COOKIES_FILE={COOKIES_FILE!r}, exists={have_cookies_file}")
 
     if is_x:
