@@ -835,6 +835,8 @@ def main():
         raise ValueError("BOT_TOKEN not set in .env file")
 
     local_api_url = os.getenv("LOCAL_BOT_API_URL", "").strip()
+    if not local_api_url:
+        local_api_url = "http://localhost:8081"
     builder = Application.builder().token(BOT_TOKEN)
     if local_api_url:
         builder = builder.base_url(local_api_url)

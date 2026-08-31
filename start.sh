@@ -18,4 +18,4 @@ if ! kill -0 $API_PID 2>/dev/null; then
 fi
 
 echo "Bot API server started. Starting bot..."
-exec python3 bot.py
+exec python3 -u bot.py
