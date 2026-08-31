@@ -215,7 +215,9 @@ def collect_image_urls(info: dict) -> list:
 
 
 def download_image_ytdlp(image_url: str, download_path: Path, idx: int) -> str:
-    fpath = download_path / f"{idx:05d}.%(ext)s"
+    is_video = ".mp4" in image_url or "video" in image_url
+    ext = "mp4" if is_video else "%(ext)s"
+    fpath = download_path / f"{idx:05d}.{ext}"
     cmd = [
         "yt-dlp",
         "--no-warnings",
@@ -224,16 +226,17 @@ def download_image_ytdlp(image_url: str, download_path: Path, idx: int) -> str:
         "--ignore-no-formats-error",
         "--no-overwrites",
         "--no-write-info-json",
+        "--legacy-server-connect",
     ] + get_cookie_args() + [
         "-o", str(fpath),
         image_url,
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if proc.returncode != 0 and proc.stderr.strip():
-            logger.error(f"Image yt-dlp stderr: {proc.stderr.strip()[:500]}")
+            logger.error(f"Download stderr: {proc.stderr.strip()[:500]}")
     except Exception as e:
-        logger.error(f"Image yt-dlp exception: {e}")
+        logger.error(f"Download exception: {e}")
         return None
     for f in download_path.iterdir():
         if f.name.startswith(f"{idx:05d}.") and f.is_file() and not f.name.endswith(".info.json") and f.stat().st_size > 0:
@@ -399,7 +402,7 @@ def get_tiktok_image_urls(url: str) -> list:
 
 
 def get_x_image_urls(url: str) -> list:
-    """Use Twitter syndication API to get image URLs from image-only posts."""
+    """Use Twitter syndication API to get media URLs (images + videos) from X/Twitter posts."""
     tweet_id_match = re.search(r"/status/(\d+)", url)
     if not tweet_id_match:
         logger.error(f"X image fetch: cannot extract tweet ID from {url}")
@@ -413,31 +416,33 @@ def get_x_image_urls(url: str) -> list:
     }
 
     try:
-        logger.info(f"X image fetch: syndication API for tweet {tweet_id}")
+        logger.info(f"X syndication API for tweet {tweet_id}")
         req = urllib.request.Request(syndication_url, headers=headers)
         resp = urllib.request.urlopen(req, timeout=15)
         data = json.loads(resp.read())
 
         urls = []
         for media in data.get("mediaDetails", []):
-            if media.get("type") == "photo":
+            media_type = media.get("type", "")
+            if media_type == "photo":
                 media_url = media.get("media_url_https", "")
                 if media_url:
                     urls.append(media_url)
-
-        if not urls:
-            for media in data.get("mediaDetails", []):
-                for key in ["media_url_https", "media_url", "url"]:
-                    val = media.get(key, "")
-                    if isinstance(val, str) and val.startswith("http"):
-                        urls.append(val)
-                        break
+            elif media_type in ("video", "animated_gif"):
+                variants = media.get("video_info", {}).get("variants", [])
+                best = None
+                for v in variants:
+                    if v.get("content_type") == "video/mp4" and v.get("url"):
+                        if best is None or v.get("bitrate", 0) > best.get("bitrate", 0):
+                            best = v
+                if best:
+                    urls.append(best["url"])
 
         urls = list(dict.fromkeys(urls))
-        logger.info(f"X image fetch: {len(urls)} image URL(s) from syndication API")
+        logger.info(f"X syndication API: {len(urls)} URL(s)")
         return urls
     except Exception as e:
-        logger.error(f"X image fetch syndication API failed: {e}")
+        logger.error(f"X syndication API failed: {e}")
     return []
 
 
@@ -509,13 +514,15 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
                 all_image_urls.append(u)
         logger.info(f"After TikTok fetch: {len(all_image_urls)} image URL(s)")
 
-    if is_x and not all_image_urls:
-        logger.info("X/Twitter: no video found, trying to get images via --dump-single-json")
+    after_ytdlp_files = set(f.name for f in download_path.iterdir() if f.is_file() and not f.name.endswith(".info.json"))
+    x_got_media = bool(after_ytdlp_files - before_files)
+    if is_x and not x_got_media and not all_image_urls:
+        logger.info("X/Twitter: yt-dlp got no files, trying syndication API")
         x_urls = get_x_image_urls(url)
         for u in x_urls:
             if u not in all_image_urls:
                 all_image_urls.append(u)
-        logger.info(f"After X image fetch: {len(all_image_urls)} image URL(s)")
+        logger.info(f"After X syndication API: {len(all_image_urls)} URL(s)")
 
     image_urls = all_image_urls
     logger.info(f"Final image URL(s): {len(image_urls)}")
