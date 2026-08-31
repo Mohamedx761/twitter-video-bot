@@ -1,17 +1,13 @@
-FROM aiogram/telegram-bot-api:latest AS api-server
+FROM aiogram/telegram-bot-api:latest
 
-FROM python:3.11-slim-bookworm
+USER root
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libstdc++6 libgcc-s1 openssl ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
-
-COPY --from=api-server /usr/local/bin/telegram-bot-api-server /usr/local/bin/telegram-bot-api-server
+RUN apk add --no-cache python3 py3-pip py3-certifi py3-openssl
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip3 install --break-system-packages --no-cache-dir -r requirements.txt
 
 COPY bot.py .
 COPY start.sh .
