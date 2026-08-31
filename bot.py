@@ -8,6 +8,7 @@ import hashlib
 from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, InputMediaVideo, InputFile
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -35,6 +36,13 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+async def safe_edit(msg, text):
+    try:
+        await msg.edit_text(text)
+    except TelegramError:
+        pass
 
 cancelled_downloads = {}
 
@@ -491,14 +499,12 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
     logger.info(f"Cookies: COOKIES_FILE={COOKIES_FILE!r}, exists={have_cookies_file}")
 
     if is_x:
-        logger.info("X/Twitter: attempting without cookies first")
-        last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=False)
-        got_something = bool(list(download_path.glob("*.info.json"))) or bool(
-            set(f.name for f in download_path.iterdir() if f.is_file()) - before_files
-        )
-        if not got_something and have_cookies_file:
-            logger.info("X/Twitter: no-cookies attempt failed, retrying with cookies")
+        if have_cookies_file:
+            logger.info("X/Twitter: using cookies")
             last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=True)
+        else:
+            logger.info("X/Twitter: no cookies file, attempting without cookies")
+            last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=False)
     else:
         last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=True)
 
@@ -731,16 +737,16 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if cancelled_downloads.get(chat_id):
-            await status_msg.edit_text("Download cancelled.")
+            await safe_edit(status_msg, "Download cancelled.")
             return
 
         if not file_paths:
-            await status_msg.edit_text("No media found.")
+            await safe_edit(status_msg, "No media found.")
             return
 
         caption = (info or {}).get("description", "") or (info or {}).get("title", "") or ""
 
-        await status_msg.edit_text(f"Uploading {len(file_paths)} file(s)...")
+        await safe_edit(status_msg, f"Uploading {len(file_paths)} file(s)...")
 
         photos = [fp for fp in file_paths if fp.lower().endswith(IMAGE_EXTS)]
         videos = [fp for fp in file_paths if fp.lower().endswith(VIDEO_EXTS)]
@@ -754,7 +760,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fp_size = os.path.getsize(photo_path) / (1024 * 1024)
             use_path = photo_path
             if fp_size > 10:
-                await status_msg.edit_text("Photo too large, compressing...")
+                await safe_edit(status_msg, "Photo too large, compressing...")
                 cpath = str(photo_path) + ".compressed.jpg"
                 await loop.run_in_executor(None, lambda p=str(photo_path), c=str(cpath): subprocess.run([
                     "ffmpeg", "-i", p, "-vf", "scale=min(1280,iw):-2",
@@ -770,7 +776,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
             use_path = video_path
             if file_size_mb > 50:
-                await status_msg.edit_text(f"Video is {file_size_mb:.1f}MB. Compressing...")
+                await safe_edit(status_msg, f"Video is {file_size_mb:.1f}MB. Compressing...")
                 cpath = str(video_path) + ".compressed.mp4"
                 await loop.run_in_executor(None, lambda v=str(video_path), c=str(cpath): subprocess.run([
                     "ffmpeg", "-i", v, "-c:v", "libx264", "-crf", "28",
@@ -784,7 +790,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     continue
             prepared_items.append((use_path, "video"))
 
-        await status_msg.edit_text(f"Uploading {len(prepared_items) + len(oversized_documents)} file(s)...")
+        await safe_edit(status_msg, f"Uploading {len(prepared_items) + len(oversized_documents)} file(s)...")
 
         for i in range(0, len(prepared_items), 10):
             group = prepared_items[i:i + 10]
@@ -830,7 +836,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Error: {error_msg}")
-        await status_msg.edit_text(f"Error: {error_msg[:200]}")
+        await safe_edit(status_msg, f"Error: {error_msg[:200]}")
 
     finally:
         cancelled_downloads.pop(chat_id, None)
