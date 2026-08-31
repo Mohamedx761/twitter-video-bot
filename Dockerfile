@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libstdc++6 libgcc-s1 openssl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=api-server /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
+COPY --from=api-server /usr/local/bin/telegram-bot-api-server /usr/local/bin/telegram-bot-api-server
 
 WORKDIR /app
 

@@ -2,7 +2,7 @@
 set -e
 
 echo "Starting Telegram Bot API server on port 8081..."
-telegram-bot-api \
+telegram-bot-api-server \
   --api-id="$TELEGRAM_API_ID" \
   --api-hash="$TELEGRAM_API_HASH" \
   --http-port=8081 \
