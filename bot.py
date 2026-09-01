@@ -426,21 +426,40 @@ def get_x_image_urls(url: str) -> list:
         data = json.loads(resp.read())
 
         urls = []
-        for media in data.get("mediaDetails", []):
-            media_type = media.get("type", "")
-            if media_type == "photo":
-                media_url = media.get("media_url_https", "")
-                if media_url:
-                    urls.append(media_url)
-            elif media_type in ("video", "animated_gif"):
-                variants = media.get("video_info", {}).get("variants", [])
-                best = None
-                for v in variants:
-                    if v.get("content_type") == "video/mp4" and v.get("url"):
-                        if best is None or v.get("bitrate", 0) > best.get("bitrate", 0):
-                            best = v
-                if best:
-                    urls.append(best["url"])
+
+        media_lists = [data.get("mediaDetails", [])]
+        if not media_lists[0]:
+            media_lists = [data.get("extended_entities", {}).get("media", [])]
+        if not media_lists[0]:
+            media_lists = [data.get("extended_entities", {}).get("mediaDetails", [])]
+
+        for media_list in media_lists:
+            for media in media_list:
+                media_type = media.get("type", "")
+                if media_type == "photo":
+                    media_url = media.get("media_url_https", "")
+                    if media_url:
+                        urls.append(media_url)
+                elif media_type in ("video", "animated_gif"):
+                    variants = media.get("video_info", {}).get("variants", [])
+                    best = None
+                    for v in variants:
+                        if v.get("content_type") == "video/mp4" and v.get("url"):
+                            if best is None or v.get("bitrate", 0) > best.get("bitrate", 0):
+                                best = v
+                    if best:
+                        urls.append(best["url"])
+                    else:
+                        for v in variants:
+                            if v.get("url"):
+                                urls.append(v["url"])
+                                break
+
+        if not urls:
+            for key in ["video_url", "video_url_https"]:
+                val = data.get(key)
+                if isinstance(val, str) and val.startswith("http"):
+                    urls.append(val)
 
         urls = list(dict.fromkeys(urls))
         logger.info(f"X syndication API: {len(urls)} URL(s)")
@@ -787,17 +806,14 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             media = []
-            files = []
             for idx, (path, kind) in enumerate(group):
-                fname = Path(path).name
-                files.append(InputFile(str(path)))
                 item_caption = caption if (i == 0 and idx == 0) else None
                 if kind == "photo":
-                    media.append(InputMediaPhoto(media=f"attach://{fname}", caption=item_caption))
+                    media.append(InputMediaPhoto(media=InputFile(str(path)), caption=item_caption))
                 else:
-                    media.append(InputMediaVideo(media=f"attach://{fname}", caption=item_caption))
+                    media.append(InputMediaVideo(media=InputFile(str(path)), caption=item_caption))
             try:
-                await context.bot.send_media_group(chat_id=chat_id, media=media, files=files)
+                await context.bot.send_media_group(chat_id=chat_id, media=media)
                 logger.info(f"send_media_group sent {len(group)} item(s)")
             except Exception as e:
                 logger.error(f"send_media_group failed: {e}, falling back to individual sends")
