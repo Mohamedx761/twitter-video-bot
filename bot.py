@@ -834,15 +834,8 @@ def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN not set in .env file")
 
-    local_api_url = os.getenv("LOCAL_BOT_API_URL", "").strip()
-    if not local_api_url:
-        local_api_url = "http://localhost:8081"
     builder = Application.builder().token(BOT_TOKEN)
-    if local_api_url:
-        builder = builder.base_url(local_api_url)
-        logger.info(f"Using local Bot API server: {local_api_url}")
-    else:
-        logger.info("Using Telegram Bot API (cloud)")
+    logger.info("Using Telegram Bot API (cloud)")
 
     application = builder.build()
 
