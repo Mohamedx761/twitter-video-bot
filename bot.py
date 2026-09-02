@@ -745,7 +745,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         videos = [fp for fp in file_paths if fp.lower().endswith(VIDEO_EXTS)]
 
         prepared_items = []
-        oversized_documents = []
 
         for photo_path in photos:
             if not os.path.exists(photo_path):
@@ -773,25 +772,36 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             use_path = video_path
             if file_size_mb > 50:
                 await safe_edit(status_msg, f"Video is {file_size_mb:.1f}MB. Compressing...")
-                cpath = str(video_path) + ".compressed.mp4"
-                try:
-                    await loop.run_in_executor(None, lambda v=str(video_path), c=str(cpath): subprocess.run([
-                        "ffmpeg", "-i", v, "-c:v", "libx264", "-crf", "35",
-                        "-vf", "scale=min(1280,iw):-2", "-c:a", "aac", "-b:a", "128k",
-                        "-movflags", "+faststart", c, "-y"
-                    ]))
-                    if os.path.exists(cpath) and os.path.getsize(cpath) < 50 * 1024 * 1024:
-                        use_path = cpath
-                    else:
-                        oversized_documents.append(video_path)
-                        continue
-                except FileNotFoundError:
-                    logger.warning("ffmpeg not found, sending original video")
-                    oversized_documents.append(video_path)
+                compress_stages = [
+                    {"crf": "35", "scale": "min(1280,iw):-2"},
+                    {"crf": "40", "scale": "min(960,iw):-2"},
+                    {"crf": "45", "scale": "min(640,iw):-2"},
+                    {"crf": "51", "scale": "min(480,iw):-2"},
+                ]
+                compressed = False
+                for stage in compress_stages:
+                    cpath = str(video_path) + f".crf{stage['crf']}.mp4"
+                    try:
+                        await loop.run_in_executor(None, lambda v=str(video_path), c=str(cpath), s=stage: subprocess.run([
+                            "ffmpeg", "-i", v, "-c:v", "libx264", "-crf", s["crf"],
+                            "-vf", s["scale"], "-c:a", "aac", "-b:a", "96k",
+                            "-movflags", "+faststart", c, "-y"
+                        ], timeout=300))
+                        if os.path.exists(cpath) and os.path.getsize(cpath) > 0:
+                            new_mb = os.path.getsize(cpath) / (1024 * 1024)
+                            logger.info(f"Compressed {file_size_mb:.1f}MB -> {new_mb:.1f}MB (CRF {stage['crf']})")
+                            if new_mb < 50:
+                                use_path = cpath
+                                compressed = True
+                                break
+                    except Exception as e:
+                        logger.error(f"ffmpeg compress failed (CRF {stage['crf']}): {e}")
+                if not compressed:
+                    await safe_edit(status_msg, f"Video is {file_size_mb:.1f}MB — too large for Telegram (50MB limit).")
                     continue
             prepared_items.append((use_path, "video"))
 
-        await safe_edit(status_msg, f"Uploading {len(prepared_items) + len(oversized_documents)} file(s)...")
+        await safe_edit(status_msg, f"Uploading {len(prepared_items)} file(s)...")
 
         for i in range(0, len(prepared_items), 10):
             group = prepared_items[i:i + 10]
@@ -823,11 +833,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             await update.message.reply_photo(photo=f, caption=caption)
                         else:
                             await update.message.reply_video(video=f, caption=caption)
-
-        for video_path in oversized_documents:
-            with open(video_path, "rb") as f:
-                await update.message.reply_document(document=f, caption=caption)
-            os.remove(video_path)
 
         await status_msg.delete()
 
