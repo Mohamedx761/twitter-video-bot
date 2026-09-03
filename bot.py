@@ -771,10 +771,10 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
             use_path = video_path
             if file_size_mb > 50:
-                await safe_edit(status_msg, f"Video is {file_size_mb:.1f}MB. Compressing to ~49MB (best quality)...")
+                await safe_edit(status_msg, f"Video is {file_size_mb:.1f}MB. Compressing to ~49MB...")
                 cpath = str(video_path) + ".compressed.mp4"
                 try:
-                    def _compress_two_pass(src, dst, target_mb=49):
+                    def _compress_to_target(src, dst, target_mb=49):
                         dur_cmd = [
                             "ffprobe", "-v", "error",
                             "-show_entries", "format=duration",
@@ -785,54 +785,46 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if duration <= 0:
                             return False
 
-                        audio_bitrate = 96
+                        audio_kbps = 96
                         target_bits = target_mb * 1024 * 1024 * 8
-                        video_bitrate = max(100, int((target_bits / duration) - audio_bitrate * 1000))
-                        maxrate = int(video_bitrate * 1.5)
-                        bufsize = int(video_bitrate * 2)
-                        passlog = str(Path(dst).parent / "ffmpeg2pass")
+                        video_kbps = max(100, int((target_bits / duration / 1000) - audio_kbps))
+                        maxrate = int(video_kbps * 1.5)
+                        bufsize = int(video_kbps * 2)
 
-                        logger.info(f"Two-pass: duration={duration:.0f}s, video_bitrate={video_bitrate}k, target={target_mb}MB")
+                        logger.info(f"Compress: duration={duration:.0f}s, video_bitrate={video_kbps}k")
 
-                        pass1 = [
+                        cmd = [
                             "ffmpeg", "-y", "-i", src,
-                            "-c:v", "libx264", "-b:v", f"{video_bitrate}k",
-                            "-maxrate", f"{maxrate}k", "-bufsize", f"{bufsize}k",
-                            "-vf", "scale='min(1280,iw)':'-2'",
-                            "-passlogfile", passlog,
-                            "-pass", "1", "-an", "-f", "null", "/dev/null"
+                            "-c:v", "libx264",
+                            "-b:v", f"{video_kbps}k",
+                            "-maxrate", f"{maxrate}k",
+                            "-bufsize", f"{bufsize}k",
+                            "-vf", "scale=min(1280,iw):-2",
+                            "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+                            "-movflags", "+faststart",
+                            dst
                         ]
-                        subprocess.run(pass1, capture_output=True, timeout=600)
-
-                        pass2 = [
-                            "ffmpeg", "-y", "-i", src,
-                            "-c:v", "libx264", "-b:v", f"{video_bitrate}k",
-                            "-maxrate", f"{maxrate}k", "-bufsize", f"{bufsize}k",
-                            "-vf", "scale='min(1280,iw)':'-2'",
-                            "-passlogfile", passlog,
-                            "-pass", "2", "-c:a", "aac", "-b:a", f"{audio_bitrate}k",
-                            "-movflags", "+faststart", dst
-                        ]
-                        subprocess.run(pass2, capture_output=True, timeout=600)
-
+                        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+                        if proc.returncode != 0:
+                            logger.error(f"ffmpeg error: {proc.stderr[:500]}")
                         return os.path.exists(dst) and os.path.getsize(dst) > 0
 
                     success = await loop.run_in_executor(
-                        None, lambda: _compress_two_pass(str(video_path), cpath)
+                        None, lambda: _compress_to_target(str(video_path), cpath)
                     )
                     if success and os.path.exists(cpath):
                         new_mb = os.path.getsize(cpath) / (1024 * 1024)
-                        logger.info(f"Two-pass result: {file_size_mb:.1f}MB -> {new_mb:.1f}MB")
+                        logger.info(f"Compressed: {file_size_mb:.1f}MB -> {new_mb:.1f}MB")
                         if new_mb < 50:
                             use_path = cpath
                         else:
-                            await safe_edit(status_msg, f"Video is {file_size_mb:.1f}MB — compression couldn't fit it under 50MB.")
+                            await safe_edit(status_msg, f"Video is {file_size_mb:.1f}MB — still {new_mb:.1f}MB after compression.")
                             continue
                     else:
                         await safe_edit(status_msg, "Compression failed.")
                         continue
                 except Exception as e:
-                    logger.error(f"Two-pass compression failed: {e}")
+                    logger.error(f"Compression failed: {e}")
                     await safe_edit(status_msg, f"Compression error: {str(e)[:100]}")
                     continue
             prepared_items.append((use_path, "video"))
