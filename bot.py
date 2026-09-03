@@ -817,12 +817,14 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         prepared_items = []
 
+        use_local = os.getenv("USE_LOCAL_SERVER", "false").lower() == "true"
+
         for photo_path in photos:
             if not os.path.exists(photo_path):
                 continue
             fp_size = os.path.getsize(photo_path) / (1024 * 1024)
             use_path = photo_path
-            if fp_size > 10:
+            if not use_local and fp_size > 10:
                 await safe_edit(status_msg, "Photo too large, compressing...")
                 cpath = str(photo_path) + ".compressed.jpg"
                 try:
@@ -836,7 +838,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.warning("ffmpeg not found, sending original photo")
             prepared_items.append((use_path, "photo"))
 
-        use_local = os.getenv("USE_LOCAL_SERVER", "false").lower() == "true"
         upload_limit_mb = 2000 if use_local else 50
 
         for video_path in videos:
@@ -947,6 +948,7 @@ def main():
 
     if use_local and local_url:
         builder = builder.base_url(f"{local_url}/bot")
+        builder = builder.base_file_url(f"{local_url}/file/bot")
         logger.info(f"Using LOCAL Bot API Server at {local_url} (2GB upload limit)")
     else:
         logger.info("Using Telegram Cloud API (50MB limit) + ffmpeg compression")

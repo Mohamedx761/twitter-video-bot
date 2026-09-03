@@ -4,7 +4,7 @@ set -e
 echo "[entrypoint] Starting Telegram Bot API Server..."
 
 telegram-bot-api \
-    --api_id="${TELEGRAM_API_ID}" \
+    --api-id="${TELEGRAM_API_ID}" \
     --api_hash="${TELEGRAM_API_HASH}" \
     --http-port=8081 \
     --local \
@@ -17,7 +17,7 @@ echo "[entrypoint] Server PID: $SERVER_PID"
 
 echo "[entrypoint] Waiting for server on port 8081..."
 RETRIES=0
-MAX_RETRIES=45
+MAX_RETRIES=30
 until curl -s -o /dev/null -w "%{http_code}" http://localhost:8081/ 2>/dev/null | grep -q "404\|200"; do
     RETRIES=$((RETRIES + 1))
     if [ $RETRIES -ge $MAX_RETRIES ]; then
