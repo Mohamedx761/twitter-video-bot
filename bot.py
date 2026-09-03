@@ -41,6 +41,32 @@ def get_video_duration(path: str) -> float:
         return 0.0
 
 
+def ensure_faststart(input_path: str) -> str:
+    """Re-mux video with -movflags +faststart for progressive streaming.
+    Does not re-encode — just moves the moov atom to the front.
+    Returns output path (same as input if skipped)."""
+    output_path = input_path + ".faststart.mp4"
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", input_path,
+             "-c", "copy", "-movflags", "+faststart",
+             output_path],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode == 0 and os.path.exists(output_path):
+            os.replace(output_path, input_path)
+            logger.info(f"faststart applied: {os.path.basename(input_path)}")
+        else:
+            logger.warning(f"faststart failed: {result.stderr[:200]}")
+            if os.path.exists(output_path):
+                os.remove(output_path)
+    except Exception as e:
+        logger.warning(f"faststart error: {e}")
+        if os.path.exists(output_path):
+            os.remove(output_path)
+    return input_path
+
+
 def compress_video(input_path: str, output_path: str, target_mb: float = 49.0) -> bool:
     """Compress video to fit under target_mb using single-pass bitrate targeting.
     Raises ValueError if video is too long/large to compress reasonably."""
@@ -876,6 +902,8 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await safe_edit(status_msg, str(ve))
                     return
             else:
+                if use_local:
+                    await loop.run_in_executor(None, ensure_faststart, video_path)
                 prepared_items.append((video_path, "video"))
 
         await safe_edit(status_msg, f"Uploading {len(prepared_items)} file(s)...")
