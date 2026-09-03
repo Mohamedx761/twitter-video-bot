@@ -41,6 +41,30 @@ def get_video_duration(path: str) -> float:
         return 0.0
 
 
+def get_video_metadata(path: str) -> dict:
+    """Extract duration, width, height via ffprobe."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_format", "-show_streams", str(path)],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return {}
+        data = json.loads(result.stdout)
+        duration = float(data.get("format", {}).get("duration", 0))
+        for s in data.get("streams", []):
+            if s.get("codec_type") == "video":
+                return {
+                    "duration": int(duration),
+                    "width": int(s.get("width", 0)),
+                    "height": int(s.get("height", 0)),
+                }
+        return {"duration": int(duration)}
+    except Exception:
+        return {}
+
+
 def ensure_faststart(input_path: str) -> str:
     """Re-mux video with -movflags +faststart for progressive streaming.
     Does not re-encode — just moves the moov atom to the front.
@@ -908,6 +932,8 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await safe_edit(status_msg, f"Uploading {len(prepared_items)} file(s)...")
 
+        video_meta_cache = {}
+
         for i in range(0, len(prepared_items), 10):
             group = prepared_items[i:i + 10]
 
@@ -919,7 +945,18 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if kind == "photo":
                             await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
                         else:
-                            await context.bot.send_video(chat_id=chat_id, video=f, caption=caption)
+                            if path not in video_meta_cache:
+                                video_meta_cache[path] = await loop.run_in_executor(
+                                    None, get_video_metadata, str(path)
+                                )
+                            meta = video_meta_cache[path]
+                            await context.bot.send_video(
+                                chat_id=chat_id, video=f, caption=caption,
+                                supports_streaming=True,
+                                duration=meta.get("duration"),
+                                width=meta.get("width"),
+                                height=meta.get("height"),
+                            )
                     logger.info(f"Sent {kind}: {os.path.basename(path)} ({file_mb:.1f}MB)")
                 except Exception as e:
                     logger.error(f"Send failed for {path}: {e}")
@@ -932,7 +969,18 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if kind == "photo":
                     media.append(InputMediaPhoto(media=InputFile(str(path)), caption=item_caption))
                 else:
-                    media.append(InputMediaVideo(media=InputFile(str(path)), caption=item_caption))
+                    if path not in video_meta_cache:
+                        video_meta_cache[path] = await loop.run_in_executor(
+                            None, get_video_metadata, str(path)
+                        )
+                    meta = video_meta_cache[path]
+                    media.append(InputMediaVideo(
+                        media=InputFile(str(path)), caption=item_caption,
+                        supports_streaming=True,
+                        duration=meta.get("duration"),
+                        width=meta.get("width"),
+                        height=meta.get("height"),
+                    ))
             try:
                 await context.bot.send_media_group(chat_id=chat_id, media=media)
                 logger.info(f"send_media_group sent {len(group)} item(s)")
@@ -944,7 +992,18 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             if kind == "photo":
                                 await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
                             else:
-                                await context.bot.send_video(chat_id=chat_id, video=f, caption=caption)
+                                if path not in video_meta_cache:
+                                    video_meta_cache[path] = await loop.run_in_executor(
+                                        None, get_video_metadata, str(path)
+                                    )
+                                meta = video_meta_cache[path]
+                                await context.bot.send_video(
+                                    chat_id=chat_id, video=f, caption=caption,
+                                    supports_streaming=True,
+                                    duration=meta.get("duration"),
+                                    width=meta.get("width"),
+                                    height=meta.get("height"),
+                                )
                     except Exception as e2:
                         logger.error(f"Individual send failed for {path}: {e2}")
 
