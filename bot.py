@@ -836,11 +836,31 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.warning("ffmpeg not found, sending original photo")
             prepared_items.append((use_path, "photo"))
 
+        use_local = os.getenv("USE_LOCAL_SERVER", "false").lower() == "true"
+        upload_limit_mb = 2000 if use_local else 50
+
         for video_path in videos:
             if not os.path.exists(video_path):
                 continue
             file_mb = os.path.getsize(video_path) / (1024 * 1024)
-            if file_mb > 50:
+            if file_mb > upload_limit_mb:
+                if use_local:
+                    await safe_edit(status_msg, f"الفيديو {file_mb:.0f}MB — كبير جداً حتى للـ Local Server (2GB حد أقصى).")
+                    return
+                await safe_edit(status_msg, f"الفيديو {file_mb:.0f}MB — بحاول أضغطه عشان يبقى تحت 50MB...")
+                cpath = str(video_path) + ".compressed.mp4"
+                try:
+                    compressed = await loop.run_in_executor(
+                        None, compress_video, video_path, cpath, 49.0
+                    )
+                    if compressed and os.path.exists(cpath):
+                        prepared_items.append((cpath, "video"))
+                    else:
+                        prepared_items.append((video_path, "video"))
+                except ValueError as ve:
+                    await safe_edit(status_msg, str(ve))
+                    return
+            elif not use_local and file_mb > 50:
                 await safe_edit(status_msg, f"الفيديو {file_mb:.0f}MB — بحاول أضغطه عشان يبقى تحت 50MB...")
                 cpath = str(video_path) + ".compressed.mp4"
                 try:
@@ -921,7 +941,15 @@ def main():
         raise ValueError("BOT_TOKEN not set in .env file")
 
     builder = Application.builder().token(BOT_TOKEN)
-    logger.info("Using Telegram Bot API (cloud) + ffmpeg compression for large files")
+
+    use_local = os.getenv("USE_LOCAL_SERVER", "false").lower() == "true"
+    local_url = os.getenv("LOCAL_API_URL", "").strip()
+
+    if use_local and local_url:
+        builder = builder.base_url(f"{local_url}/bot")
+        logger.info(f"Using LOCAL Bot API Server at {local_url} (2GB upload limit)")
+    else:
+        logger.info("Using Telegram Cloud API (50MB limit) + ffmpeg compression")
 
     application = builder.build()
 
