@@ -42,10 +42,11 @@ def get_video_duration(path: str) -> float:
 
 
 def compress_video(input_path: str, output_path: str, target_mb: float = 49.0) -> bool:
-    """Compress video to fit under target_mb using single-pass bitrate targeting."""
+    """Compress video to fit under target_mb using single-pass bitrate targeting.
+    Raises ValueError if video is too long/large to compress reasonably."""
     duration = get_video_duration(input_path)
     if duration <= 0:
-        return False
+        raise ValueError("مقدرش أحدد مدة الفيديو.")
 
     size_bytes = os.path.getsize(input_path)
     target_bytes = target_mb * 1024 * 1024
@@ -55,6 +56,15 @@ def compress_video(input_path: str, output_path: str, target_mb: float = 49.0) -
     audio_bitrate_kbps = 128
     total_bitrate = (target_bytes * 8 * 0.95) / duration
     video_bitrate_kbps = max(100, int((total_bitrate / 1000) - audio_bitrate_kbps))
+
+    if video_bitrate_kbps < 300:
+        minutes = int(duration // 60)
+        size_mb = int(size_bytes / (1024 * 1024))
+        raise ValueError(
+            f"الفيديو كبير جداً ({size_mb}MB، {minutes} دقيقة).\n"
+            f"الحد الأقصى للإرسال هو 50MB، والضغط ممكن يخلي الجودة سيئة جداً.\n"
+            f"جرب تبعت فيديو أقصر أو أصغر."
+        )
     maxrate_kbps = int(video_bitrate_kbps * 1.5)
     bufsize_kbps = int(video_bitrate_kbps * 2)
 
@@ -831,15 +841,19 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
             file_mb = os.path.getsize(video_path) / (1024 * 1024)
             if file_mb > 50:
-                await safe_edit(status_msg, f"Video is {file_mb:.0f}MB, compressing to fit 50MB limit...")
+                await safe_edit(status_msg, f"الفيديو {file_mb:.0f}MB — بحاول أضغطه عشان يبقى تحت 50MB...")
                 cpath = str(video_path) + ".compressed.mp4"
-                compressed = await loop.run_in_executor(
-                    None, compress_video, video_path, cpath, 49.0
-                )
-                if compressed and os.path.exists(cpath):
-                    prepared_items.append((cpath, "video"))
-                else:
-                    prepared_items.append((video_path, "video"))
+                try:
+                    compressed = await loop.run_in_executor(
+                        None, compress_video, video_path, cpath, 49.0
+                    )
+                    if compressed and os.path.exists(cpath):
+                        prepared_items.append((cpath, "video"))
+                    else:
+                        prepared_items.append((video_path, "video"))
+                except ValueError as ve:
+                    await safe_edit(status_msg, str(ve))
+                    return
             else:
                 prepared_items.append((video_path, "video"))
 
