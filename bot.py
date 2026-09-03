@@ -340,10 +340,38 @@ def collect_image_urls(info: dict) -> list:
     return result
 
 
+def _download_direct_url(url: str, dest: Path, timeout: int = 300) -> bool:
+    """Download a direct URL (e.g. Twitter CDN MP4) via urllib with proper headers."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Referer": "https://x.com/",
+    }
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        with open(dest, "wb") as f:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                f.write(chunk)
+        return dest.exists() and dest.stat().st_size > 0
+    except Exception as e:
+        logger.error(f"Direct download failed: {e}")
+        return False
+
+
 def download_image_ytdlp(image_url: str, download_path: Path, idx: int) -> str:
-    is_video = ".mp4" in image_url or "video" in image_url
+    is_video = ".mp4" in image_url or "video.twimg.com" in image_url
     ext = "mp4" if is_video else "%(ext)s"
     fpath = download_path / f"{idx:05d}.{ext}"
+
+    if is_video and "video.twimg.com" in image_url:
+        logger.info(f"Trying direct CDN download for: {image_url[:80]}")
+        if _download_direct_url(image_url, fpath):
+            return str(fpath)
+        logger.warning("Direct CDN download failed, falling back to yt-dlp")
+
     cmd = [
         "yt-dlp",
         "--no-warnings",
