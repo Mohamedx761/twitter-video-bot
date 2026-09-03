@@ -8,7 +8,7 @@ import hashlib
 import urllib.request
 from pathlib import Path
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, InputMediaVideo, InputFile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, InputMediaVideo, InputFile, Bot
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -25,7 +25,17 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip().strip('"').strip("'")
 AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0").strip().strip('"').strip("'"))
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads").strip().strip('"').strip("'"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip().strip('"').strip("'")
+LOCAL_API_URL = os.getenv("LOCAL_API_URL", "http://localhost:8081").strip().strip('"').strip("'")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+local_bot = Bot(token=BOT_TOKEN, base_url=LOCAL_API_URL)
+
+async def is_local_server_available() -> bool:
+    try:
+        me = await local_bot.get_me()
+        return True
+    except Exception:
+        return False
 
 def get_cookie_args() -> list:
     paths = [COOKIES_FILE, "cookies.txt"] if COOKIES_FILE else ["cookies.txt"]
@@ -768,68 +778,19 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for video_path in videos:
             if not os.path.exists(video_path):
                 continue
-            file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
-            use_path = video_path
-            if file_size_mb > 50:
-                await safe_edit(status_msg, f"Video is {file_size_mb:.1f}MB. Compressing to ~49MB...")
-                cpath = str(video_path) + ".compressed.mp4"
-                try:
-                    def _compress_to_target(src, dst, target_mb=49):
-                        dur_cmd = [
-                            "ffprobe", "-v", "error",
-                            "-show_entries", "format=duration",
-                            "-of", "default=noprint_wrappers=1:nokey=1", src
-                        ]
-                        dur_result = subprocess.run(dur_cmd, capture_output=True, text=True, timeout=30)
-                        duration = float(dur_result.stdout.strip()) if dur_result.stdout.strip() else 0
-                        if duration <= 0:
-                            return False
-
-                        audio_kbps = 96
-                        target_bits = target_mb * 1024 * 1024 * 8
-                        video_kbps = max(100, int((target_bits / duration / 1000) - audio_kbps))
-                        maxrate = int(video_kbps * 1.5)
-                        bufsize = int(video_kbps * 2)
-
-                        logger.info(f"Compress: duration={duration:.0f}s, video_bitrate={video_kbps}k")
-
-                        cmd = [
-                            "ffmpeg", "-y", "-i", src,
-                            "-c:v", "libx264",
-                            "-b:v", f"{video_kbps}k",
-                            "-maxrate", f"{maxrate}k",
-                            "-bufsize", f"{bufsize}k",
-                            "-vf", "scale=min(1280,iw):-2",
-                            "-c:a", "aac", "-b:a", f"{audio_kbps}k",
-                            "-movflags", "+faststart",
-                            dst
-                        ]
-                        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-                        if proc.returncode != 0:
-                            logger.error(f"ffmpeg error: {proc.stderr[:500]}")
-                        return os.path.exists(dst) and os.path.getsize(dst) > 0
-
-                    success = await loop.run_in_executor(
-                        None, lambda: _compress_to_target(str(video_path), cpath)
-                    )
-                    if success and os.path.exists(cpath):
-                        new_mb = os.path.getsize(cpath) / (1024 * 1024)
-                        logger.info(f"Compressed: {file_size_mb:.1f}MB -> {new_mb:.1f}MB")
-                        if new_mb < 50:
-                            use_path = cpath
-                        else:
-                            await safe_edit(status_msg, f"Video is {file_size_mb:.1f}MB — still {new_mb:.1f}MB after compression.")
-                            continue
-                    else:
-                        await safe_edit(status_msg, "Compression failed.")
-                        continue
-                except Exception as e:
-                    logger.error(f"Compression failed: {e}")
-                    await safe_edit(status_msg, f"Compression error: {str(e)[:100]}")
-                    continue
-            prepared_items.append((use_path, "video"))
+            prepared_items.append((video_path, "video"))
 
         await safe_edit(status_msg, f"Uploading {len(prepared_items)} file(s)...")
+
+        has_large = any(
+            os.path.getsize(p) > 50 * 1024 * 1024
+            for p, _ in prepared_items
+        )
+        use_local = has_large and await is_local_server_available()
+        if has_large and not use_local:
+            logger.warning("Files >50MB found but local server unavailable")
+
+        active_bot = local_bot if use_local else context.bot
 
         for i in range(0, len(prepared_items), 10):
             group = prepared_items[i:i + 10]
@@ -838,9 +799,9 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 path, kind = group[0]
                 with open(path, "rb") as f:
                     if kind == "photo":
-                        await update.message.reply_photo(photo=f, caption=caption)
+                        await active_bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
                     else:
-                        await update.message.reply_video(video=f, caption=caption)
+                        await active_bot.send_video(chat_id=chat_id, video=f, caption=caption)
                 continue
 
             media = []
@@ -851,16 +812,16 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     media.append(InputMediaVideo(media=InputFile(str(path)), caption=item_caption))
             try:
-                await context.bot.send_media_group(chat_id=chat_id, media=media)
+                await active_bot.send_media_group(chat_id=chat_id, media=media)
                 logger.info(f"send_media_group sent {len(group)} item(s)")
             except Exception as e:
                 logger.error(f"send_media_group failed: {e}, falling back to individual sends")
                 for path, kind in group:
                     with open(path, "rb") as f:
                         if kind == "photo":
-                            await update.message.reply_photo(photo=f, caption=caption)
+                            await active_bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
                         else:
-                            await update.message.reply_video(video=f, caption=caption)
+                            await active_bot.send_video(chat_id=chat_id, video=f, caption=caption)
 
         await status_msg.delete()
 
@@ -884,7 +845,7 @@ def main():
         raise ValueError("BOT_TOKEN not set in .env file")
 
     builder = Application.builder().token(BOT_TOKEN)
-    logger.info("Using Telegram Bot API (cloud)")
+    logger.info("Using Telegram Bot API (cloud) + Local Bot API Server for large files")
 
     application = builder.build()
 
