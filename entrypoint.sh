@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 set -e
 
 echo "[entrypoint] Starting Telegram Bot API Server..."
@@ -18,13 +18,18 @@ echo "[entrypoint] Server PID: $SERVER_PID"
 echo "[entrypoint] Waiting for server on port 8081..."
 RETRIES=0
 MAX_RETRIES=30
-until curl -s -o /dev/null -w "%{http_code}" http://localhost:8081/ 2>/dev/null | grep -q "404\|200"; do
+while [ $RETRIES -lt $MAX_RETRIES ]; do
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8081/ 2>/dev/null || true)
+    case "$HTTP_CODE" in
+        200|404)
+            echo "[entrypoint] Server is ready!"
+            export USE_LOCAL_SERVER="true"
+            export LOCAL_API_URL="http://localhost:8081"
+            echo "[entrypoint] Starting bot..."
+            exec python3 -u bot.py
+            ;;
+    esac
     RETRIES=$((RETRIES + 1))
-    if [ $RETRIES -ge $MAX_RETRIES ]; then
-        echo "[entrypoint] WARN: Server not ready after ${MAX_RETRIES}s — starting bot with cloud API fallback"
-        export USE_LOCAL_SERVER="false"
-        break
-    fi
     if ! kill -0 $SERVER_PID 2>/dev/null; then
         echo "[entrypoint] WARN: Server process exited — starting bot with cloud API fallback"
         export USE_LOCAL_SERVER="false"
@@ -33,11 +38,7 @@ until curl -s -o /dev/null -w "%{http_code}" http://localhost:8081/ 2>/dev/null 
     sleep 1
 done
 
-if curl -s -o /dev/null -w "%{http_code}" http://localhost:8081/ 2>/dev/null | grep -q "404\|200"; then
-    echo "[entrypoint] Server is ready!"
-    export USE_LOCAL_SERVER="true"
-    export LOCAL_API_URL="http://localhost:8081"
-fi
-
+echo "[entrypoint] WARN: Server not ready after ${MAX_RETRIES}s — starting bot with cloud API fallback"
+export USE_LOCAL_SERVER="false"
 echo "[entrypoint] Starting bot..."
 exec python3 -u bot.py
