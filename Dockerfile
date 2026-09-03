@@ -1,15 +1,13 @@
-FROM aiogram/telegram-bot-api:latest AS tgapi
+FROM aiogram/telegram-bot-api:latest
 
-FROM python:3.12-alpine
-
-RUN apk add --no-cache ffmpeg libstdc++
-
-COPY --from=tgapi /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv ffmpeg curl \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
 COPY cookies.txt .
