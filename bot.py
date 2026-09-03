@@ -29,12 +29,20 @@ LOCAL_API_URL = os.getenv("LOCAL_API_URL", "http://localhost:8081").strip().stri
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 local_bot = Bot(token=BOT_TOKEN, base_url=LOCAL_API_URL)
+_local_server_ok = None
 
 async def is_local_server_available() -> bool:
+    global _local_server_ok
+    if _local_server_ok is not None:
+        return _local_server_ok
     try:
         me = await local_bot.get_me()
+        logger.info(f"Local Bot API Server OK: @{me.username}")
+        _local_server_ok = True
         return True
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Local Bot API Server unavailable: {e}")
+        _local_server_ok = False
         return False
 
 def get_cookie_args() -> list:
@@ -787,8 +795,13 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for p, _ in prepared_items
         )
         use_local = has_large and await is_local_server_available()
-        if has_large and not use_local:
-            logger.warning("Files >50MB found but local server unavailable")
+        if has_large:
+            if use_local:
+                logger.info("Using Local Bot API Server for large file(s)")
+                await safe_edit(status_msg, f"Uploading {len(prepared_items)} file(s) via Local Server (full quality)...")
+            else:
+                logger.warning("Files >50MB found but local server unavailable - trying cloud API")
+                await safe_edit(status_msg, f"Uploading {len(prepared_items)} file(s) via Cloud API...")
 
         active_bot = local_bot if use_local else context.bot
 
@@ -797,11 +810,17 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if len(group) == 1:
                 path, kind = group[0]
-                with open(path, "rb") as f:
-                    if kind == "photo":
-                        await active_bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
-                    else:
-                        await active_bot.send_video(chat_id=chat_id, video=f, caption=caption)
+                file_mb = os.path.getsize(path) / (1024 * 1024)
+                try:
+                    with open(path, "rb") as f:
+                        if kind == "photo":
+                            await active_bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
+                        else:
+                            await active_bot.send_video(chat_id=chat_id, video=f, caption=caption)
+                    logger.info(f"Sent {kind}: {os.path.basename(path)} ({file_mb:.1f}MB)")
+                except Exception as e:
+                    logger.error(f"Send failed for {path}: {e}")
+                    await safe_edit(status_msg, f"Failed to send {os.path.basename(path)} ({file_mb:.1f}MB): {str(e)[:150]}")
                 continue
 
             media = []
@@ -817,11 +836,14 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"send_media_group failed: {e}, falling back to individual sends")
                 for path, kind in group:
-                    with open(path, "rb") as f:
-                        if kind == "photo":
-                            await active_bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
-                        else:
-                            await active_bot.send_video(chat_id=chat_id, video=f, caption=caption)
+                    try:
+                        with open(path, "rb") as f:
+                            if kind == "photo":
+                                await active_bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
+                            else:
+                                await active_bot.send_video(chat_id=chat_id, video=f, caption=caption)
+                    except Exception as e2:
+                        logger.error(f"Individual send failed for {path}: {e2}")
 
         await status_msg.delete()
 
