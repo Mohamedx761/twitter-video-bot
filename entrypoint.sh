@@ -5,7 +5,7 @@ echo "[entrypoint] Starting Telegram Bot API Server..."
 
 telegram-bot-api \
     --api-id="${TELEGRAM_API_ID}" \
-    --api_hash="${TELEGRAM_API_HASH}" \
+    --api-hash="${TELEGRAM_API_HASH}" \
     --http-port=8081 \
     --local \
     --dir=/var/lib/telegram-bot-api \
