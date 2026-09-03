@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates pkg-config wget \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth 1 https://github.com/tdlib/telegram-bot-api.git /tmp/telegram-bot-api
+RUN git clone --recursive --depth 1 https://github.com/tdlib/telegram-bot-api.git /tmp/telegram-bot-api
 
 WORKDIR /tmp/telegram-bot-api
 
