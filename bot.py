@@ -949,6 +949,9 @@ def main():
     if use_local and local_url:
         builder = builder.base_url(f"{local_url}/bot")
         builder = builder.base_file_url(f"{local_url}/file/bot")
+        builder = builder.connect_timeout(30)
+        builder = builder.read_timeout(300)
+        builder = builder.write_timeout(300)
         logger.info(f"Using LOCAL Bot API Server at {local_url} (2GB upload limit)")
     else:
         logger.info("Using Telegram Cloud API (50MB limit) + ffmpeg compression")
