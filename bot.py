@@ -52,21 +52,23 @@ def compress_video(input_path: str, output_path: str, target_mb: float = 49.0) -
     if size_bytes <= target_bytes:
         return False
 
-    target_bits = target_bytes * 8 * 0.95
-    video_bitrate = int(target_bits / duration)
-    maxrate = int(video_bitrate * 1.5)
-    bufsize = int(video_bitrate * 2)
-    audio_bitrate = min(128, int((target_bits / duration - video_bitrate) / 1000))
+    audio_bitrate_kbps = 128
+    total_bitrate = (target_bytes * 8 * 0.95) / duration
+    video_bitrate_kbps = max(100, int((total_bitrate / 1000) - audio_bitrate_kbps))
+    maxrate_kbps = int(video_bitrate_kbps * 1.5)
+    bufsize_kbps = int(video_bitrate_kbps * 2)
+
+    logger.info(f"Compressing: {size_bytes/(1024*1024):.1f}MB target={target_mb}MB duration={duration:.0f}s vbitrate={video_bitrate_kbps}k abitrate={audio_bitrate_kbps}k")
 
     cmd = [
         "ffmpeg", "-y", "-i", input_path,
         "-c:v", "libx264",
-        "-b:v", f"{video_bitrate}",
-        "-maxrate", f"{maxrate}",
-        "-bufsize", f"{bufsize}",
+        "-b:v", f"{video_bitrate_kbps}k",
+        "-maxrate", f"{maxrate_kbps}k",
+        "-bufsize", f"{bufsize_kbps}k",
         "-preset", "fast",
         "-c:a", "aac",
-        "-b:a", f"{audio_bitrate}k",
+        "-b:a", f"{audio_bitrate_kbps}k",
         "-movflags", "+faststart",
         output_path,
     ]
