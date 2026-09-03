@@ -4,7 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake git libssl-dev zlib1g-dev \
-    ca-certificates pkg-config wget \
+    ca-certificates pkg-config wget gperf \
     && rm -rf /var/lib/apt/lists/*
 
 RUN git clone --recursive --depth 1 https://github.com/tdlib/telegram-bot-api.git /tmp/telegram-bot-api
