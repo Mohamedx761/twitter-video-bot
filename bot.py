@@ -8,7 +8,7 @@ import hashlib
 import urllib.request
 from pathlib import Path
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, InputMediaVideo, InputFile, Bot
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, InputMediaVideo, InputFile
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -25,25 +25,66 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip().strip('"').strip("'")
 AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0").strip().strip('"').strip("'"))
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads").strip().strip('"').strip("'"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip().strip('"').strip("'")
-LOCAL_API_URL = os.getenv("LOCAL_API_URL", "http://localhost:8081").strip().strip('"').strip("'")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-local_bot = Bot(token=BOT_TOKEN, base_url=LOCAL_API_URL)
-_local_server_ok = None
 
-async def is_local_server_available() -> bool:
-    global _local_server_ok
-    if _local_server_ok is not None:
-        return _local_server_ok
+def get_video_duration(path: str) -> float:
+    """Get video duration in seconds using ffprobe."""
     try:
-        me = await local_bot.get_me()
-        logger.info(f"Local Bot API Server OK: @{me.username}")
-        _local_server_ok = True
-        return True
-    except Exception as e:
-        logger.warning(f"Local Bot API Server unavailable: {e}")
-        _local_server_ok = False
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=30
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+def compress_video(input_path: str, output_path: str, target_mb: float = 49.0) -> bool:
+    """Compress video to fit under target_mb using single-pass bitrate targeting."""
+    duration = get_video_duration(input_path)
+    if duration <= 0:
         return False
+
+    size_bytes = os.path.getsize(input_path)
+    target_bytes = target_mb * 1024 * 1024
+    if size_bytes <= target_bytes:
+        return False
+
+    target_bits = target_bytes * 8 * 0.95
+    video_bitrate = int(target_bits / duration)
+    maxrate = int(video_bitrate * 1.5)
+    bufsize = int(video_bitrate * 2)
+    audio_bitrate = min(128, int((target_bits / duration - video_bitrate) / 1000))
+
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-c:v", "libx264",
+        "-b:v", f"{video_bitrate}",
+        "-maxrate", f"{maxrate}",
+        "-bufsize", f"{bufsize}",
+        "-preset", "fast",
+        "-c:a", "aac",
+        "-b:a", f"{audio_bitrate}k",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if proc.returncode != 0:
+            logger.error(f"ffmpeg error: {proc.stderr[:500]}")
+            return False
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            out_size = os.path.getsize(output_path) / (1024 * 1024)
+            logger.info(f"Compressed: {size_bytes/(1024*1024):.1f}MB -> {out_size:.1f}MB")
+            return True
+    except subprocess.TimeoutExpired:
+        logger.error("ffmpeg compression timed out")
+    except FileNotFoundError:
+        logger.error("ffmpeg not found")
+    return False
 
 def get_cookie_args() -> list:
     paths = [COOKIES_FILE, "cookies.txt"] if COOKIES_FILE else ["cookies.txt"]
@@ -786,24 +827,21 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for video_path in videos:
             if not os.path.exists(video_path):
                 continue
-            prepared_items.append((video_path, "video"))
+            file_mb = os.path.getsize(video_path) / (1024 * 1024)
+            if file_mb > 50:
+                await safe_edit(status_msg, f"Video is {file_mb:.0f}MB, compressing to fit 50MB limit...")
+                cpath = str(video_path) + ".compressed.mp4"
+                compressed = await loop.run_in_executor(
+                    None, compress_video, video_path, cpath, 49.0
+                )
+                if compressed and os.path.exists(cpath):
+                    prepared_items.append((cpath, "video"))
+                else:
+                    prepared_items.append((video_path, "video"))
+            else:
+                prepared_items.append((video_path, "video"))
 
         await safe_edit(status_msg, f"Uploading {len(prepared_items)} file(s)...")
-
-        has_large = any(
-            os.path.getsize(p) > 50 * 1024 * 1024
-            for p, _ in prepared_items
-        )
-        use_local = has_large and await is_local_server_available()
-        if has_large:
-            if use_local:
-                logger.info("Using Local Bot API Server for large file(s)")
-                await safe_edit(status_msg, f"Uploading {len(prepared_items)} file(s) via Local Server (full quality)...")
-            else:
-                logger.warning("Files >50MB found but local server unavailable - trying cloud API")
-                await safe_edit(status_msg, f"Uploading {len(prepared_items)} file(s) via Cloud API...")
-
-        active_bot = local_bot if use_local else context.bot
 
         for i in range(0, len(prepared_items), 10):
             group = prepared_items[i:i + 10]
@@ -814,9 +852,9 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     with open(path, "rb") as f:
                         if kind == "photo":
-                            await active_bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
+                            await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
                         else:
-                            await active_bot.send_video(chat_id=chat_id, video=f, caption=caption)
+                            await context.bot.send_video(chat_id=chat_id, video=f, caption=caption)
                     logger.info(f"Sent {kind}: {os.path.basename(path)} ({file_mb:.1f}MB)")
                 except Exception as e:
                     logger.error(f"Send failed for {path}: {e}")
@@ -831,7 +869,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     media.append(InputMediaVideo(media=InputFile(str(path)), caption=item_caption))
             try:
-                await active_bot.send_media_group(chat_id=chat_id, media=media)
+                await context.bot.send_media_group(chat_id=chat_id, media=media)
                 logger.info(f"send_media_group sent {len(group)} item(s)")
             except Exception as e:
                 logger.error(f"send_media_group failed: {e}, falling back to individual sends")
@@ -839,9 +877,9 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     try:
                         with open(path, "rb") as f:
                             if kind == "photo":
-                                await active_bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
+                                await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
                             else:
-                                await active_bot.send_video(chat_id=chat_id, video=f, caption=caption)
+                                await context.bot.send_video(chat_id=chat_id, video=f, caption=caption)
                     except Exception as e2:
                         logger.error(f"Individual send failed for {path}: {e2}")
 
@@ -867,7 +905,7 @@ def main():
         raise ValueError("BOT_TOKEN not set in .env file")
 
     builder = Application.builder().token(BOT_TOKEN)
-    logger.info("Using Telegram Bot API (cloud) + Local Bot API Server for large files")
+    logger.info("Using Telegram Bot API (cloud) + ffmpeg compression for large files")
 
     application = builder.build()
 
