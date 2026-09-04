@@ -640,18 +640,29 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
     have_cookies_file = any(Path(p).exists() for p in _cookie_paths if p)
     logger.info(f"Cookies: COOKIES_FILE={COOKIES_FILE!r}, exists={have_cookies_file}")
 
+    all_image_urls = []
+    info = {}
+    last_stderr = ""
+
     if is_x:
-        if have_cookies_file:
-            logger.info("X/Twitter: using cookies")
-            last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=True)
-        else:
-            logger.info("X/Twitter: no cookies file, attempting without cookies")
-            last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=False)
+        logger.info("X/Twitter: trying syndication API first (fast)")
+        x_urls = get_x_image_urls(url)
+        for u in x_urls:
+            if u not in all_image_urls:
+                all_image_urls.append(u)
+        logger.info(f"X syndication API returned: {len(all_image_urls)} URL(s)")
+
+        if not all_image_urls:
+            logger.info("X/Twitter: syndication API got nothing, falling back to yt-dlp")
+            if have_cookies_file:
+                logger.info("X/Twitter: using cookies")
+                last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=True)
+            else:
+                logger.info("X/Twitter: no cookies file, attempting without cookies")
+                last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=False)
     else:
         last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=True)
 
-    all_image_urls = []
-    info = {}
     for f in sorted(download_path.glob("*.info.json")):
         try:
             with open(f) as fp:
@@ -685,15 +696,9 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
                 all_image_urls.append(u)
         logger.info(f"After TikTok fetch: {len(all_image_urls)} image URL(s)")
 
-    after_ytdlp_files = set(f.name for f in download_path.iterdir() if f.is_file() and not f.name.endswith(".info.json"))
-    x_got_media = bool(after_ytdlp_files - before_files)
-    if is_x and not x_got_media and not all_image_urls:
-        logger.info("X/Twitter: yt-dlp got no files, trying syndication API")
-        x_urls = get_x_image_urls(url)
-        for u in x_urls:
-            if u not in all_image_urls:
-                all_image_urls.append(u)
-        logger.info(f"After X syndication API: {len(all_image_urls)} URL(s)")
+    if not is_x:
+        after_ytdlp_files = set(f.name for f in download_path.iterdir() if f.is_file() and not f.name.endswith(".info.json"))
+        x_got_media = bool(after_ytdlp_files - before_files)
 
     image_urls = all_image_urls
     logger.info(f"Final image URL(s): {len(image_urls)}")
