@@ -506,7 +506,6 @@ def run_ytdlp_download(url: str, download_path: Path, is_carousel: bool, is_x: b
         "--write-info-json",
         "--no-overwrites",
         "--concurrent-fragments", "4",
-        "--extractor-args", "youtube:player_client=ios,web",
     ]
     if use_cookies:
         cmd_dl += get_cookie_args()
@@ -1025,8 +1024,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await loop.run_in_executor(None, ensure_faststart, video_path)
                 prepared_items.append((video_path, "video"))
 
-        await safe_edit(status_msg, f"Uploading {len(prepared_items)} file(s)...")
-
         video_meta_cache = {}
         thumb_cache = {}
 
@@ -1072,10 +1069,13 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             media = []
+            file_handles = []
             for idx, (path, kind) in enumerate(group):
                 item_caption = caption if (i == 0 and idx == 0) else None
                 if kind == "photo":
-                    media.append(InputMediaPhoto(media=InputFile(str(path)), caption=item_caption))
+                    fh = open(path, "rb")
+                    file_handles.append(fh)
+                    media.append(InputMediaPhoto(media=fh, caption=item_caption))
                 else:
                     if path not in video_meta_cache:
                         video_meta_cache[path] = await loop.run_in_executor(
@@ -1088,18 +1088,21 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                     thumb_path = thumb_cache.get(path)
                     thumb_file = open(thumb_path, "rb") if thumb_path else None
+                    fh = open(path, "rb")
+                    file_handles.append(fh)
+                    if thumb_file:
+                        file_handles.append(thumb_file)
                     try:
                         media.append(InputMediaVideo(
-                            media=InputFile(str(path)), caption=item_caption,
+                            media=fh, caption=item_caption,
                             supports_streaming=True,
                             duration=meta.get("duration"),
                             width=meta.get("width"),
                             height=meta.get("height"),
                             thumbnail=thumb_file,
                         ))
-                    finally:
-                        if thumb_file:
-                            thumb_file.close()
+                    except Exception:
+                        pass
             try:
                 await context.bot.send_media_group(chat_id=chat_id, media=media)
                 logger.info(f"send_media_group sent {len(group)} item(s)")
@@ -1138,6 +1141,12 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                         thumb_file.close()
                     except Exception as e2:
                         logger.error(f"Individual send failed for {path}: {e2}")
+            finally:
+                for fh in file_handles:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
 
         await status_msg.delete()
 
