@@ -340,7 +340,23 @@ def collect_image_urls(info: dict) -> list:
     return result
 
 
-def _download_direct_url(url: str, dest: Path, timeout: int = 300) -> bool:
+def extract_thumbnail(video_path: str) -> str | None:
+    """Extract a single frame thumbnail from a video via ffmpeg."""
+    thumb_path = video_path + ".thumb.jpg"
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", video_path, "-ss", "00:00:01",
+             "-vframes", "1", "-q:v", "3", thumb_path],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0 and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+            return thumb_path
+    except Exception as e:
+        logger.warning(f"Thumbnail extraction failed: {e}")
+    return None
+
+
+def _download_direct_url(url: str, dest: Path, timeout: int = 300, progress_cb=None) -> bool:
     """Download a direct URL (e.g. Twitter CDN MP4) via urllib with proper headers."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -349,26 +365,31 @@ def _download_direct_url(url: str, dest: Path, timeout: int = 300) -> bool:
     try:
         req = urllib.request.Request(url, headers=headers)
         resp = urllib.request.urlopen(req, timeout=timeout)
+        total = int(resp.headers.get("Content-Length", 0))
+        downloaded = 0
         with open(dest, "wb") as f:
             while True:
                 chunk = resp.read(65536)
                 if not chunk:
                     break
                 f.write(chunk)
+                downloaded += len(chunk)
+                if progress_cb and total > 0:
+                    progress_cb(downloaded, total)
         return dest.exists() and dest.stat().st_size > 0
     except Exception as e:
         logger.error(f"Direct download failed: {e}")
         return False
 
 
-def download_image_ytdlp(image_url: str, download_path: Path, idx: int) -> str:
+def download_image_ytdlp(image_url: str, download_path: Path, idx: int, progress_cb=None) -> str:
     is_video = ".mp4" in image_url or "video.twimg.com" in image_url
     ext = "mp4" if is_video else "%(ext)s"
     fpath = download_path / f"{idx:05d}.{ext}"
 
     if is_video and "video.twimg.com" in image_url:
         logger.info(f"Trying direct CDN download for: {image_url[:80]}")
-        if _download_direct_url(image_url, fpath):
+        if _download_direct_url(image_url, fpath, progress_cb=progress_cb):
             return str(fpath)
         logger.warning("Direct CDN download failed, falling back to yt-dlp")
 
@@ -618,7 +639,7 @@ def get_x_image_urls(url: str) -> list:
     return []
 
 
-def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: int, app: Application) -> tuple[dict, list]:
+def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: int, app: Application, progress: dict = None) -> tuple[dict, list]:
     downloaded_files = []
     before_files = set(f.name for f in download_path.iterdir() if f.is_file())
 
@@ -704,8 +725,15 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
     logger.info(f"Final image URL(s): {len(image_urls)}")
     seen_hashes = set()
     image_idx = 0
+    total_urls = len(image_urls)
     for image_url in image_urls:
-        fp = download_image_ytdlp(image_url, download_path, image_idx)
+        def _dl_progress(downloaded, total, _idx=image_idx, _total=total_urls):
+            pct = int(downloaded * 100 / total) if total > 0 else 0
+            mb_done = downloaded / (1024 * 1024)
+            mb_total = total / (1024 * 1024)
+            if progress is not None:
+                progress["msg"] = f"⬇️ تحميل {_idx+1}/{_total}: {pct}% ({mb_done:.1f}/{mb_total:.1f}MB)"
+        fp = download_image_ytdlp(image_url, download_path, image_idx, progress_cb=_dl_progress)
         image_idx += 1
         if fp:
             h = hashlib.md5(Path(fp).read_bytes()).hexdigest()
@@ -879,9 +907,31 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         loop = asyncio.get_running_loop()
-        info, file_paths = await loop.run_in_executor(
-            None, extract_media, url, DOWNLOAD_DIR, chat_id, status_msg.message_id, context.application
-        )
+        progress = {"msg": ""}
+
+        async def _poll_progress():
+            last = ""
+            while True:
+                await asyncio.sleep(2)
+                cur = progress.get("msg", "")
+                if cur and cur != last:
+                    last = cur
+                    try:
+                        await status_msg.edit_text(cur, reply_markup=cancel_keyboard)
+                    except Exception:
+                        pass
+
+        poll_task = asyncio.ensure_future(_poll_progress())
+        try:
+            info, file_paths = await loop.run_in_executor(
+                None, extract_media, url, DOWNLOAD_DIR, chat_id, status_msg.message_id, context.application, progress
+            )
+        finally:
+            poll_task.cancel()
+            try:
+                await poll_task
+            except asyncio.CancelledError:
+                pass
 
         if cancelled_downloads.get(chat_id):
             await safe_edit(status_msg, "Download cancelled.")
@@ -966,6 +1016,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(status_msg, f"Uploading {len(prepared_items)} file(s)...")
 
         video_meta_cache = {}
+        thumb_cache = {}
 
         for i in range(0, len(prepared_items), 10):
             group = prepared_items[i:i + 10]
@@ -974,6 +1025,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 path, kind = group[0]
                 file_mb = os.path.getsize(path) / (1024 * 1024)
                 try:
+                    await safe_edit(status_msg, f"⬆️ رفع {i+1}/{len(prepared_items)} — {os.path.basename(path)} ({file_mb:.1f}MB)")
                     with open(path, "rb") as f:
                         if kind == "photo":
                             await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
@@ -983,13 +1035,24 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     None, get_video_metadata, str(path)
                                 )
                             meta = video_meta_cache[path]
-                            await context.bot.send_video(
-                                chat_id=chat_id, video=f, caption=caption,
-                                supports_streaming=True,
-                                duration=meta.get("duration"),
-                                width=meta.get("width"),
-                                height=meta.get("height"),
-                            )
+                            if path not in thumb_cache:
+                                thumb_cache[path] = await loop.run_in_executor(
+                                    None, extract_thumbnail, str(path)
+                                )
+                            thumb_path = thumb_cache.get(path)
+                            thumb_file = open(thumb_path, "rb") if thumb_path else None
+                            try:
+                                await context.bot.send_video(
+                                    chat_id=chat_id, video=f, caption=caption,
+                                    supports_streaming=True,
+                                    duration=meta.get("duration"),
+                                    width=meta.get("width"),
+                                    height=meta.get("height"),
+                                    thumbnail=thumb_file,
+                                )
+                            finally:
+                                if thumb_file:
+                                    thumb_file.close()
                     logger.info(f"Sent {kind}: {os.path.basename(path)} ({file_mb:.1f}MB)")
                 except Exception as e:
                     logger.error(f"Send failed for {path}: {e}")
@@ -1007,13 +1070,24 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             None, get_video_metadata, str(path)
                         )
                     meta = video_meta_cache[path]
-                    media.append(InputMediaVideo(
-                        media=InputFile(str(path)), caption=item_caption,
-                        supports_streaming=True,
-                        duration=meta.get("duration"),
-                        width=meta.get("width"),
-                        height=meta.get("height"),
-                    ))
+                    if path not in thumb_cache:
+                        thumb_cache[path] = await loop.run_in_executor(
+                            None, extract_thumbnail, str(path)
+                        )
+                    thumb_path = thumb_cache.get(path)
+                    thumb_file = open(thumb_path, "rb") if thumb_path else None
+                    try:
+                        media.append(InputMediaVideo(
+                            media=InputFile(str(path)), caption=item_caption,
+                            supports_streaming=True,
+                            duration=meta.get("duration"),
+                            width=meta.get("width"),
+                            height=meta.get("height"),
+                            thumbnail=thumb_file,
+                        ))
+                    finally:
+                        if thumb_file:
+                            thumb_file.close()
             try:
                 await context.bot.send_media_group(chat_id=chat_id, media=media)
                 logger.info(f"send_media_group sent {len(group)} item(s)")
@@ -1021,6 +1095,8 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"send_media_group failed: {e}, falling back to individual sends")
                 for path, kind in group:
                     try:
+                        file_mb = os.path.getsize(path) / (1024 * 1024)
+                        await safe_edit(status_msg, f"⬆️ رفع بديل — {os.path.basename(path)} ({file_mb:.1f}MB)")
                         with open(path, "rb") as f:
                             if kind == "photo":
                                 await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
@@ -1030,13 +1106,24 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                         None, get_video_metadata, str(path)
                                     )
                                 meta = video_meta_cache[path]
-                                await context.bot.send_video(
-                                    chat_id=chat_id, video=f, caption=caption,
-                                    supports_streaming=True,
-                                    duration=meta.get("duration"),
-                                    width=meta.get("width"),
-                                    height=meta.get("height"),
-                                )
+                                if path not in thumb_cache:
+                                    thumb_cache[path] = await loop.run_in_executor(
+                                        None, extract_thumbnail, str(path)
+                                    )
+                                thumb_path = thumb_cache.get(path)
+                                thumb_file = open(thumb_path, "rb") if thumb_path else None
+                                try:
+                                    await context.bot.send_video(
+                                        chat_id=chat_id, video=f, caption=caption,
+                                        supports_streaming=True,
+                                        duration=meta.get("duration"),
+                                        width=meta.get("width"),
+                                        height=meta.get("height"),
+                                        thumbnail=thumb_file,
+                                    )
+                                finally:
+                                    if thumb_file:
+                                        thumb_file.close()
                     except Exception as e2:
                         logger.error(f"Individual send failed for {path}: {e2}")
 
