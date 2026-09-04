@@ -908,11 +908,14 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         loop = asyncio.get_running_loop()
         progress = {"msg": ""}
+        _poll_enabled = {"v": True}
 
         async def _poll_progress():
             last = ""
             while True:
                 await asyncio.sleep(2)
+                if not _poll_enabled["v"]:
+                    continue
                 cur = progress.get("msg", "")
                 if cur and cur != last:
                     last = cur
@@ -920,6 +923,15 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await status_msg.edit_text(cur, reply_markup=cancel_keyboard)
                     except Exception:
                         pass
+
+        async def _safe_edit(msg, text):
+            _poll_enabled["v"] = False
+            try:
+                await msg.edit_text(text)
+            except TelegramError:
+                pass
+            finally:
+                _poll_enabled["v"] = True
 
         poll_task = asyncio.ensure_future(_poll_progress())
         try:
@@ -932,6 +944,8 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await poll_task
             except asyncio.CancelledError:
                 pass
+
+        safe_edit = _safe_edit
 
         if cancelled_downloads.get(chat_id):
             await safe_edit(status_msg, "Download cancelled.")
