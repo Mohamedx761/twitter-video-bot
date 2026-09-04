@@ -505,6 +505,8 @@ def run_ytdlp_download(url: str, download_path: Path, is_carousel: bool, is_x: b
         "--ignore-no-formats-error",
         "--write-info-json",
         "--no-overwrites",
+        "--concurrent-fragments", "4",
+        "--extractor-args", "youtube:player_client=ios,web",
     ]
     if use_cookies:
         cmd_dl += get_cookie_args()
@@ -513,7 +515,6 @@ def run_ytdlp_download(url: str, download_path: Path, is_carousel: bool, is_x: b
         cmd_dl += [
             "--verbose",
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            "--legacy-server-connect",
         ]
     if not is_carousel:
         cmd_dl.append("--no-playlist")
