@@ -169,6 +169,9 @@ async def safe_edit(msg, text):
         pass
 
 cancelled_downloads = {}
+_download_semaphore = asyncio.Semaphore(1)
+_queue_counter = {"value": 0}
+_queue_lock = asyncio.Lock()
 
 
 def is_authorized(user_id: int) -> bool:
@@ -900,218 +903,157 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     cancelled_downloads[chat_id] = False
 
+    async with _queue_lock:
+        _queue_counter["value"] += 1
+        position = _queue_counter["value"]
+
+    if position == 1:
+        status_text = "⏳ جاري التحميل..."
+    else:
+        status_text = f"⏳ في دور #{position} — في انتظار التحميل..."
+
     status_msg = await update.message.reply_text(
-        "Starting download...",
+        status_text,
         reply_markup=cancel_keyboard,
     )
 
     try:
-        loop = asyncio.get_running_loop()
-        progress = {"msg": ""}
-        _edit_lock = asyncio.Lock()
+        async with _download_semaphore:
+            async with _queue_lock:
+                _queue_counter["value"] = max(0, _queue_counter["value"] - 1)
 
-        async def _poll_progress():
-            last = ""
-            while True:
-                await asyncio.sleep(2)
-                cur = progress.get("msg", "")
-                if cur and cur != last:
-                    last = cur
-                    async with _edit_lock:
-                        try:
-                            await status_msg.edit_text(cur, reply_markup=cancel_keyboard)
-                        except Exception:
-                            pass
+            if position > 1:
+                await safe_edit(status_msg, "⏳ جاري التحميل...")
 
-        async def _safe_edit(msg, text):
-            async with _edit_lock:
+            loop = asyncio.get_running_loop()
+            progress = {"msg": ""}
+            _edit_lock = asyncio.Lock()
+
+            async def _poll_progress():
+                last = ""
+                while True:
+                    await asyncio.sleep(2)
+                    cur = progress.get("msg", "")
+                    if cur and cur != last:
+                        last = cur
+                        async with _edit_lock:
+                            try:
+                                await status_msg.edit_text(cur, reply_markup=cancel_keyboard)
+                            except Exception:
+                                pass
+
+            async def _safe_edit(msg, text):
+                async with _edit_lock:
+                    try:
+                        await msg.edit_text(text)
+                    except TelegramError:
+                        pass
+
+            safe_edit = _safe_edit
+
+            poll_task = asyncio.ensure_future(_poll_progress())
+            try:
+                info, file_paths = await loop.run_in_executor(
+                    None, extract_media, url, DOWNLOAD_DIR, chat_id, status_msg.message_id, context.application, progress
+                )
+            finally:
+                poll_task.cancel()
                 try:
-                    await msg.edit_text(text)
-                except TelegramError:
+                    await poll_task
+                except asyncio.CancelledError:
                     pass
 
-        safe_edit = _safe_edit
+            if cancelled_downloads.get(chat_id):
+                await safe_edit(status_msg, "تم الإلغاء.")
+                return
 
-        poll_task = asyncio.ensure_future(_poll_progress())
-        try:
-            info, file_paths = await loop.run_in_executor(
-                None, extract_media, url, DOWNLOAD_DIR, chat_id, status_msg.message_id, context.application, progress
-            )
-        finally:
-            poll_task.cancel()
-            try:
-                await poll_task
-            except asyncio.CancelledError:
-                pass
+            if not file_paths:
+                await safe_edit(status_msg, "❌ مفيش ميديا في البوست ده.")
+                return
 
-        if cancelled_downloads.get(chat_id):
-            await safe_edit(status_msg, "Download cancelled.")
-            return
+            caption = (info or {}).get("description", "") or (info or {}).get("title", "") or ""
 
-        if not file_paths:
-            await safe_edit(status_msg, "No media found.")
-            return
+            await safe_edit(status_msg, f"⬆️ رفع {len(file_paths)} ملف...")
 
-        caption = (info or {}).get("description", "") or (info or {}).get("title", "") or ""
+            photos = [fp for fp in file_paths if fp.lower().endswith(IMAGE_EXTS)]
+            videos = [fp for fp in file_paths if fp.lower().endswith(VIDEO_EXTS)]
 
-        await safe_edit(status_msg, f"Uploading {len(file_paths)} file(s)...")
+            prepared_items = []
 
-        photos = [fp for fp in file_paths if fp.lower().endswith(IMAGE_EXTS)]
-        videos = [fp for fp in file_paths if fp.lower().endswith(VIDEO_EXTS)]
+            use_local = os.getenv("USE_LOCAL_SERVER", "false").lower() == "true"
 
-        prepared_items = []
+            for photo_path in photos:
+                if not os.path.exists(photo_path):
+                    continue
+                fp_size = os.path.getsize(photo_path) / (1024 * 1024)
+                use_path = photo_path
+                if not use_local and fp_size > 10:
+                    await safe_edit(status_msg, "الصورة كبيرة — بدلّصها...")
+                    cpath = str(photo_path) + ".compressed.jpg"
+                    try:
+                        await loop.run_in_executor(None, lambda p=str(photo_path), c=str(cpath): subprocess.run([
+                            "ffmpeg", "-i", p, "-vf", "scale=min(1280,iw):-2",
+                            "-q:v", "2", c, "-y"
+                        ]))
+                        if os.path.exists(cpath) and os.path.getsize(cpath) < 10 * 1024 * 1024:
+                            use_path = cpath
+                    except FileNotFoundError:
+                        logger.warning("ffmpeg not found, sending original photo")
+                prepared_items.append((use_path, "photo"))
 
-        use_local = os.getenv("USE_LOCAL_SERVER", "false").lower() == "true"
+            upload_limit_mb = 2000 if use_local else 50
 
-        for photo_path in photos:
-            if not os.path.exists(photo_path):
-                continue
-            fp_size = os.path.getsize(photo_path) / (1024 * 1024)
-            use_path = photo_path
-            if not use_local and fp_size > 10:
-                await safe_edit(status_msg, "Photo too large, compressing...")
-                cpath = str(photo_path) + ".compressed.jpg"
-                try:
-                    await loop.run_in_executor(None, lambda p=str(photo_path), c=str(cpath): subprocess.run([
-                        "ffmpeg", "-i", p, "-vf", "scale=min(1280,iw):-2",
-                        "-q:v", "2", c, "-y"
-                    ]))
-                    if os.path.exists(cpath) and os.path.getsize(cpath) < 10 * 1024 * 1024:
-                        use_path = cpath
-                except FileNotFoundError:
-                    logger.warning("ffmpeg not found, sending original photo")
-            prepared_items.append((use_path, "photo"))
-
-        upload_limit_mb = 2000 if use_local else 50
-
-        for video_path in videos:
-            if not os.path.exists(video_path):
-                continue
-            file_mb = os.path.getsize(video_path) / (1024 * 1024)
-            if file_mb > upload_limit_mb:
-                if use_local:
-                    await safe_edit(status_msg, f"الفيديو {file_mb:.0f}MB — كبير جداً حتى للـ Local Server (2GB حد أقصى).")
-                    return
-                await safe_edit(status_msg, f"الفيديو {file_mb:.0f}MB — بحاول أضغطه عشان يبقى تحت 50MB...")
-                cpath = str(video_path) + ".compressed.mp4"
-                try:
-                    compressed = await loop.run_in_executor(
-                        None, compress_video, video_path, cpath, 49.0
-                    )
-                    if compressed and os.path.exists(cpath):
-                        prepared_items.append((cpath, "video"))
-                    else:
-                        prepared_items.append((video_path, "video"))
-                except ValueError as ve:
-                    await safe_edit(status_msg, str(ve))
-                    return
-            elif not use_local and file_mb > 50:
-                await safe_edit(status_msg, f"الفيديو {file_mb:.0f}MB — بحاول أضغطه عشان يبقى تحت 50MB...")
-                cpath = str(video_path) + ".compressed.mp4"
-                try:
-                    compressed = await loop.run_in_executor(
-                        None, compress_video, video_path, cpath, 49.0
-                    )
-                    if compressed and os.path.exists(cpath):
-                        prepared_items.append((cpath, "video"))
-                    else:
-                        prepared_items.append((video_path, "video"))
-                except ValueError as ve:
-                    await safe_edit(status_msg, str(ve))
-                    return
-            else:
-                if use_local:
-                    await loop.run_in_executor(None, ensure_faststart, video_path)
-                prepared_items.append((video_path, "video"))
-
-        video_meta_cache = {}
-        thumb_cache = {}
-
-        for i in range(0, len(prepared_items), 10):
-            group = prepared_items[i:i + 10]
-
-            if len(group) == 1:
-                path, kind = group[0]
-                file_mb = os.path.getsize(path) / (1024 * 1024)
-                try:
-                    await safe_edit(status_msg, f"⬆️ رفع {i+1}/{len(prepared_items)} — {os.path.basename(path)} ({file_mb:.1f}MB)")
-                    with open(path, "rb") as f:
-                        if kind == "photo":
-                            await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
+            for video_path in videos:
+                if not os.path.exists(video_path):
+                    continue
+                file_mb = os.path.getsize(video_path) / (1024 * 1024)
+                if file_mb > upload_limit_mb:
+                    if use_local:
+                        await safe_edit(status_msg, f"❌ الفيديو {file_mb:.0f}MB — كبير جداً حتى للـ Local Server (2GB حد أقصى).")
+                        return
+                    await safe_edit(status_msg, f"الفيديو {file_mb:.0f}MB — بحاول أضغطه...")
+                    cpath = str(video_path) + ".compressed.mp4"
+                    try:
+                        compressed = await loop.run_in_executor(
+                            None, compress_video, video_path, cpath, 49.0
+                        )
+                        if compressed and os.path.exists(cpath):
+                            prepared_items.append((cpath, "video"))
                         else:
-                            if path not in video_meta_cache:
-                                video_meta_cache[path] = await loop.run_in_executor(
-                                    None, get_video_metadata, str(path)
-                                )
-                            meta = video_meta_cache[path]
-                            if path not in thumb_cache:
-                                thumb_cache[path] = await loop.run_in_executor(
-                                    None, extract_thumbnail, str(path)
-                                )
-                            thumb_path = thumb_cache.get(path)
-                            thumb_file = open(thumb_path, "rb") if thumb_path else None
-                            try:
-                                await context.bot.send_video(
-                                    chat_id=chat_id, video=f, caption=caption,
-                                    supports_streaming=True,
-                                    duration=meta.get("duration"),
-                                    width=meta.get("width"),
-                                    height=meta.get("height"),
-                                    thumbnail=thumb_file,
-                                )
-                            finally:
-                                if thumb_file:
-                                    thumb_file.close()
-                    logger.info(f"Sent {kind}: {os.path.basename(path)} ({file_mb:.1f}MB)")
-                except Exception as e:
-                    logger.error(f"Send failed for {path}: {e}")
-                    await safe_edit(status_msg, f"Failed to send {os.path.basename(path)} ({file_mb:.1f}MB): {str(e)[:150]}")
-                continue
-
-            media = []
-            file_handles = []
-            for idx, (path, kind) in enumerate(group):
-                item_caption = caption if (i == 0 and idx == 0) else None
-                if kind == "photo":
-                    fh = open(path, "rb")
-                    file_handles.append(fh)
-                    media.append(InputMediaPhoto(media=fh, caption=item_caption))
+                            prepared_items.append((video_path, "video"))
+                    except ValueError as ve:
+                        await safe_edit(status_msg, f"❌ {ve}")
+                        return
+                elif not use_local and file_mb > 50:
+                    await safe_edit(status_msg, f"الفيديو {file_mb:.0f}MB — بحاول أضغطه...")
+                    cpath = str(video_path) + ".compressed.mp4"
+                    try:
+                        compressed = await loop.run_in_executor(
+                            None, compress_video, video_path, cpath, 49.0
+                        )
+                        if compressed and os.path.exists(cpath):
+                            prepared_items.append((cpath, "video"))
+                        else:
+                            prepared_items.append((video_path, "video"))
+                    except ValueError as ve:
+                        await safe_edit(status_msg, f"❌ {ve}")
+                        return
                 else:
-                    if path not in video_meta_cache:
-                        video_meta_cache[path] = await loop.run_in_executor(
-                            None, get_video_metadata, str(path)
-                        )
-                    meta = video_meta_cache[path]
-                    if path not in thumb_cache:
-                        thumb_cache[path] = await loop.run_in_executor(
-                            None, extract_thumbnail, str(path)
-                        )
-                    thumb_path = thumb_cache.get(path)
-                    thumb_file = open(thumb_path, "rb") if thumb_path else None
-                    fh = open(path, "rb")
-                    file_handles.append(fh)
-                    if thumb_file:
-                        file_handles.append(thumb_file)
+                    if use_local:
+                        await loop.run_in_executor(None, ensure_faststart, video_path)
+                    prepared_items.append((video_path, "video"))
+
+            video_meta_cache = {}
+            thumb_cache = {}
+
+            for i in range(0, len(prepared_items), 10):
+                group = prepared_items[i:i + 10]
+
+                if len(group) == 1:
+                    path, kind = group[0]
+                    file_mb = os.path.getsize(path) / (1024 * 1024)
                     try:
-                        media.append(InputMediaVideo(
-                            media=fh, caption=item_caption,
-                            supports_streaming=True,
-                            duration=meta.get("duration"),
-                            width=meta.get("width"),
-                            height=meta.get("height"),
-                            thumbnail=thumb_file,
-                        ))
-                    except Exception:
-                        pass
-            try:
-                await context.bot.send_media_group(chat_id=chat_id, media=media)
-                logger.info(f"send_media_group sent {len(group)} item(s)")
-            except Exception as e:
-                logger.error(f"send_media_group failed: {e}, falling back to individual sends")
-                for path, kind in group:
-                    try:
-                        file_mb = os.path.getsize(path) / (1024 * 1024)
-                        await safe_edit(status_msg, f"⬆️ رفع بديل — {os.path.basename(path)} ({file_mb:.1f}MB)")
+                        await safe_edit(status_msg, f"⬆️ رفع {i+1}/{len(prepared_items)} — {os.path.basename(path)} ({file_mb:.1f}MB)")
                         with open(path, "rb") as f:
                             if kind == "photo":
                                 await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
@@ -1139,21 +1081,98 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 finally:
                                     if thumb_file:
                                         thumb_file.close()
-                    except Exception as e2:
-                        logger.error(f"Individual send failed for {path}: {e2}")
-            finally:
-                for fh in file_handles:
-                    try:
-                        fh.close()
-                    except Exception:
-                        pass
+                        logger.info(f"Sent {kind}: {os.path.basename(path)} ({file_mb:.1f}MB)")
+                    except Exception as e:
+                        logger.error(f"Send failed for {path}: {e}")
+                        await safe_edit(status_msg, f"❌ فشل إرسال {os.path.basename(path)} ({file_mb:.1f}MB): {str(e)[:150]}")
+                    continue
 
-        await status_msg.delete()
+                media = []
+                file_handles = []
+                for idx, (path, kind) in enumerate(group):
+                    item_caption = caption if (i == 0 and idx == 0) else None
+                    if kind == "photo":
+                        fh = open(path, "rb")
+                        file_handles.append(fh)
+                        media.append(InputMediaPhoto(media=fh, caption=item_caption))
+                    else:
+                        if path not in video_meta_cache:
+                            video_meta_cache[path] = await loop.run_in_executor(
+                                None, get_video_metadata, str(path)
+                            )
+                        meta = video_meta_cache[path]
+                        if path not in thumb_cache:
+                            thumb_cache[path] = await loop.run_in_executor(
+                                None, extract_thumbnail, str(path)
+                            )
+                        thumb_path = thumb_cache.get(path)
+                        thumb_file = open(thumb_path, "rb") if thumb_path else None
+                        fh = open(path, "rb")
+                        file_handles.append(fh)
+                        if thumb_file:
+                            file_handles.append(thumb_file)
+                        try:
+                            media.append(InputMediaVideo(
+                                media=fh, caption=item_caption,
+                                supports_streaming=True,
+                                duration=meta.get("duration"),
+                                width=meta.get("width"),
+                                height=meta.get("height"),
+                                thumbnail=thumb_file,
+                            ))
+                        except Exception:
+                            pass
+                try:
+                    await context.bot.send_media_group(chat_id=chat_id, media=media)
+                    logger.info(f"send_media_group sent {len(group)} item(s)")
+                except Exception as e:
+                    logger.error(f"send_media_group failed: {e}, falling back to individual sends")
+                    for path, kind in group:
+                        try:
+                            file_mb = os.path.getsize(path) / (1024 * 1024)
+                            await safe_edit(status_msg, f"⬆️ رفع بديل — {os.path.basename(path)} ({file_mb:.1f}MB)")
+                            with open(path, "rb") as f:
+                                if kind == "photo":
+                                    await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
+                                else:
+                                    if path not in video_meta_cache:
+                                        video_meta_cache[path] = await loop.run_in_executor(
+                                            None, get_video_metadata, str(path)
+                                        )
+                                    meta = video_meta_cache[path]
+                                    if path not in thumb_cache:
+                                        thumb_cache[path] = await loop.run_in_executor(
+                                            None, extract_thumbnail, str(path)
+                                        )
+                                    thumb_path = thumb_cache.get(path)
+                                    thumb_file = open(thumb_path, "rb") if thumb_path else None
+                                    try:
+                                        await context.bot.send_video(
+                                            chat_id=chat_id, video=f, caption=caption,
+                                            supports_streaming=True,
+                                            duration=meta.get("duration"),
+                                            width=meta.get("width"),
+                                            height=meta.get("height"),
+                                            thumbnail=thumb_file,
+                                        )
+                                    finally:
+                                        if thumb_file:
+                                            thumb_file.close()
+                        except Exception as e2:
+                            logger.error(f"Individual send failed for {path}: {e2}")
+                finally:
+                    for fh in file_handles:
+                        try:
+                            fh.close()
+                        except Exception:
+                            pass
+
+            await status_msg.delete()
 
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Error: {error_msg}")
-        await safe_edit(status_msg, f"Error: {error_msg[:200]}")
+        await safe_edit(status_msg, f"❌ فشل التحميل:\n{error_msg[:200]}")
 
     finally:
         cancelled_downloads.pop(chat_id, None)
