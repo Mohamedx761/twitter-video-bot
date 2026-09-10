@@ -265,104 +265,67 @@ def _get_api_url():
 
 
 async def _send_video_isolated(chat_id, path, caption, meta=None, thumb_path=None, timeout=300):
-    """Upload video via isolated curl subprocess. Each upload gets its own
-    process, so a hang/kill never corrupts the bot's httpx connection pool."""
-    api_url = _get_api_url()
-    cmd = [
-        "curl", "-s", "-X", "POST", f"{api_url}/sendVideo",
-        "--max-time", str(timeout),
-        "-F", f"chat_id={chat_id}",
-        "-F", f"video=@{path}",
-        "-F", "supports_streaming=true",
-    ]
-    if caption:
-        cmd.extend(["-F", f"caption={caption[:1024]}"])
-    if meta:
-        if meta.get("duration"):
-            cmd.extend(["-F", f"duration={meta['duration']}"])
-        if meta.get("width"):
-            cmd.extend(["-F", f"width={meta['width']}"])
-        if meta.get("height"):
-            cmd.extend(["-F", f"height={meta['height']}"])
-    if thumb_path and os.path.exists(thumb_path):
-        cmd.extend(["-F", f"thumbnail=@{thumb_path}"])
+    """Upload video via a fresh httpx client per request.
+    Each upload gets its own client + connection, so a hang/kill never
+    corrupts the bot's shared httpx session."""
+    import httpx as _httpx
 
-    logger.info(f"curl upload: {os.path.basename(path)} -> sendVideo")
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout + 10)
-        output = stdout.decode(errors="replace").strip()
-        if proc.returncode != 0:
-            err = stderr.decode(errors="replace").strip()[:300]
-            raise Exception(f"curl failed (rc={proc.returncode}): {err}")
-        result = json.loads(output) if output else {}
+    api_url = _get_api_url()
+    url = f"{api_url}/sendVideo"
+
+    client_timeout = _httpx.Timeout(connect=15, read=60, write=timeout, pool=10)
+    async with _httpx.AsyncClient(timeout=client_timeout) as client:
+        data = {"chat_id": str(chat_id), "supports_streaming": "true"}
+        if caption:
+            data["caption"] = caption[:1024]
+        if meta:
+            if meta.get("duration"):
+                data["duration"] = str(meta["duration"])
+            if meta.get("width"):
+                data["width"] = str(meta["width"])
+            if meta.get("height"):
+                data["height"] = str(meta["height"])
+
+        files = {}
+        with open(path, "rb") as vf:
+            files["video"] = (os.path.basename(path), vf, "video/mp4")
+            if thumb_path and os.path.exists(thumb_path):
+                with open(thumb_path, "rb") as tf:
+                    files["thumbnail"] = (os.path.basename(thumb_path), tf, "image/jpeg")
+                    logger.info(f"httpx upload: {os.path.basename(path)} -> sendVideo")
+                    resp = await client.post(url, data=data, files=files)
+            else:
+                logger.info(f"httpx upload: {os.path.basename(path)} -> sendVideo")
+                resp = await client.post(url, data=data, files=files)
+
+        result = resp.json()
         if not result.get("ok"):
-            desc = result.get("description", output[:200])
-            raise Exception(f"Telegram API: {desc}")
+            raise Exception(f"Telegram API: {result.get('description', str(result)[:200])}")
         return result
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-            await proc.communicate()
-        except Exception:
-            pass
-        raise asyncio.TimeoutError(f"curl upload timed out after {timeout}s")
-    except Exception:
-        try:
-            proc.kill()
-            await proc.communicate()
-        except Exception:
-            pass
-        raise
 
 
 async def _send_photo_isolated(chat_id, path, caption, timeout=120):
-    """Upload photo via isolated curl subprocess."""
-    api_url = _get_api_url()
-    cmd = [
-        "curl", "-s", "-X", "POST", f"{api_url}/sendPhoto",
-        "--max-time", str(timeout),
-        "-F", f"chat_id={chat_id}",
-        "-F", f"photo=@{path}",
-    ]
-    if caption:
-        cmd.extend(["-F", f"caption={caption[:1024]}"])
+    """Upload photo via a fresh httpx client per request."""
+    import httpx as _httpx
 
-    logger.info(f"curl upload: {os.path.basename(path)} -> sendPhoto")
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout + 10)
-        output = stdout.decode(errors="replace").strip()
-        if proc.returncode != 0:
-            err = stderr.decode(errors="replace").strip()[:300]
-            raise Exception(f"curl failed (rc={proc.returncode}): {err}")
-        result = json.loads(output) if output else {}
+    api_url = _get_api_url()
+    url = f"{api_url}/sendPhoto"
+
+    client_timeout = _httpx.Timeout(connect=15, read=30, write=timeout, pool=10)
+    async with _httpx.AsyncClient(timeout=client_timeout) as client:
+        data = {"chat_id": str(chat_id)}
+        if caption:
+            data["caption"] = caption[:1024]
+
+        with open(path, "rb") as pf:
+            files = {"photo": (os.path.basename(path), pf, "image/jpeg")}
+            logger.info(f"httpx upload: {os.path.basename(path)} -> sendPhoto")
+            resp = await client.post(url, data=data, files=files)
+
+        result = resp.json()
         if not result.get("ok"):
-            desc = result.get("description", output[:200])
-            raise Exception(f"Telegram API: {desc}")
+            raise Exception(f"Telegram API: {result.get('description', str(result)[:200])}")
         return result
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-            await proc.communicate()
-        except Exception:
-            pass
-        raise asyncio.TimeoutError(f"curl photo upload timed out after {timeout}s")
-    except Exception:
-        try:
-            proc.kill()
-            await proc.communicate()
-        except Exception:
-            pass
-        raise
 
 
 def dedupe_thumbnails(file_paths):
