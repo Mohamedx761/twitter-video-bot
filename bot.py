@@ -577,13 +577,13 @@ def run_ytdlp_download(url: str, download_path: Path, is_carousel: bool, is_x: b
     cmd_dl.append(url)
 
     try:
-        proc = subprocess.run(cmd_dl, capture_output=True, text=True, timeout=600)
+        proc = subprocess.run(cmd_dl, capture_output=True, text=True, timeout=300)
         stderr = proc.stderr or ""
         if stderr.strip():
             logger.error(f"yt-dlp stderr (cookies={use_cookies}): {stderr.strip()[:1000]}")
         return stderr
     except subprocess.TimeoutExpired:
-        raise ValueError("Download timed out (10 min limit).")
+        raise ValueError("التحميل أخد وقت طويل اوى (5 دقايق). جرب تاني أو تأكد إن اللنك شغال.")
     except FileNotFoundError:
         raise ValueError("yt-dlp not found.")
 
@@ -998,9 +998,16 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             poll_task = asyncio.ensure_future(_poll_progress())
             try:
-                info, file_paths = await loop.run_in_executor(
-                    None, extract_media, url, DOWNLOAD_DIR, chat_id, status_msg.message_id, context.application, progress
-                )
+                try:
+                    info, file_paths = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None, extract_media, url, DOWNLOAD_DIR, chat_id, status_msg.message_id, context.application, progress
+                        ),
+                        timeout=300,
+                    )
+                except asyncio.TimeoutError:
+                    await safe_edit(status_msg, "❌ التحميل أخد وقت طويل اوى — اللنك ده متقفش عليه وبنроб في اللي بعده.")
+                    return
             finally:
                 poll_task.cancel()
                 try:
@@ -1101,7 +1108,10 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await safe_edit(status_msg, f"⬆️ رفع {i+1}/{len(prepared_items)} — {os.path.basename(path)} ({file_mb:.1f}MB)")
                         with open(path, "rb") as f:
                             if kind == "photo":
-                                await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
+                                await asyncio.wait_for(
+                                    context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption),
+                                    timeout=120,
+                                )
                             else:
                                 if path not in video_meta_cache:
                                     video_meta_cache[path] = await loop.run_in_executor(
@@ -1115,18 +1125,24 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 thumb_path = thumb_cache.get(path)
                                 thumb_file = open(thumb_path, "rb") if thumb_path else None
                                 try:
-                                    await context.bot.send_video(
-                                        chat_id=chat_id, video=f, caption=caption,
-                                        supports_streaming=True,
-                                        duration=meta.get("duration"),
-                                        width=meta.get("width"),
-                                        height=meta.get("height"),
-                                        thumbnail=thumb_file,
+                                    await asyncio.wait_for(
+                                        context.bot.send_video(
+                                            chat_id=chat_id, video=f, caption=caption,
+                                            supports_streaming=True,
+                                            duration=meta.get("duration"),
+                                            width=meta.get("width"),
+                                            height=meta.get("height"),
+                                            thumbnail=thumb_file,
+                                        ),
+                                        timeout=120,
                                     )
                                 finally:
                                     if thumb_file:
                                         thumb_file.close()
                         logger.info(f"Sent {kind}: {os.path.basename(path)} ({file_mb:.1f}MB)")
+                    except asyncio.TimeoutError:
+                        logger.error(f"Send timed out for {path}")
+                        await safe_edit(status_msg, f"❌ رفع {os.path.basename(path)} ({file_mb:.1f}MB) أخد وقت طويل — تم تخطيه.")
                     except Exception as e:
                         logger.error(f"Send failed for {path}: {e}")
                         await safe_edit(status_msg, f"❌ فشل إرسال {os.path.basename(path)} ({file_mb:.1f}MB): {str(e)[:150]}")
@@ -1170,8 +1186,14 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         except Exception:
                             pass
                 try:
-                    await context.bot.send_media_group(chat_id=chat_id, media=media)
+                    await asyncio.wait_for(
+                        context.bot.send_media_group(chat_id=chat_id, media=media),
+                        timeout=180,
+                    )
                     logger.info(f"send_media_group sent {len(group)} item(s)")
+                except asyncio.TimeoutError:
+                    logger.error(f"send_media_group timed out for group starting at {i}")
+                    await safe_edit(status_msg, f"❌ رفع المجموعة ({len(group)} ملف) أخد وقت طويل — تم تخطيه.")
                 except Exception as e:
                     logger.error(f"send_media_group failed: {e}, falling back to individual sends")
                     for path, kind in group:
@@ -1180,7 +1202,10 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             await safe_edit(status_msg, f"⬆️ رفع بديل — {os.path.basename(path)} ({file_mb:.1f}MB)")
                             with open(path, "rb") as f:
                                 if kind == "photo":
-                                    await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
+                                    await asyncio.wait_for(
+                                        context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption),
+                                        timeout=120,
+                                    )
                                 else:
                                     if path not in video_meta_cache:
                                         video_meta_cache[path] = await loop.run_in_executor(
@@ -1194,17 +1219,22 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     thumb_path = thumb_cache.get(path)
                                     thumb_file = open(thumb_path, "rb") if thumb_path else None
                                     try:
-                                        await context.bot.send_video(
-                                            chat_id=chat_id, video=f, caption=caption,
-                                            supports_streaming=True,
-                                            duration=meta.get("duration"),
-                                            width=meta.get("width"),
-                                            height=meta.get("height"),
-                                            thumbnail=thumb_file,
+                                        await asyncio.wait_for(
+                                            context.bot.send_video(
+                                                chat_id=chat_id, video=f, caption=caption,
+                                                supports_streaming=True,
+                                                duration=meta.get("duration"),
+                                                width=meta.get("width"),
+                                                height=meta.get("height"),
+                                                thumbnail=thumb_file,
+                                            ),
+                                            timeout=120,
                                         )
                                     finally:
                                         if thumb_file:
                                             thumb_file.close()
+                        except asyncio.TimeoutError:
+                            logger.error(f"Fallback send timed out for {path}")
                         except Exception as e2:
                             logger.error(f"Individual send failed for {path}: {e2}")
                 finally:
@@ -1218,10 +1248,19 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await status_msg.delete()
 
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout processing {url}")
+        try:
+            await safe_edit(status_msg, "❌ العملية أخدت وقت طويل اوى — اللنك ده اتقف عليه.")
+        except Exception:
+            pass
     except Exception as e:
         error_msg = str(e)
-        logger.error(f"Error: {error_msg}")
-        await safe_edit(status_msg, f"❌ فشل التحميل:\n{error_msg[:200]}")
+        logger.error(f"Error processing {url}: {error_msg}")
+        try:
+            await safe_edit(status_msg, f"❌ فشل التحميل:\n{error_msg[:200]}")
+        except Exception:
+            pass
 
     finally:
         cancelled_downloads.pop(chat_id, None)
