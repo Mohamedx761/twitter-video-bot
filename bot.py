@@ -254,6 +254,115 @@ def _cleanup_file(path):
         pass
 
 
+def _get_api_url():
+    use_local = os.getenv("USE_LOCAL_SERVER", "false").lower() == "true"
+    local_url = os.getenv("LOCAL_API_URL", "").strip()
+    if use_local and local_url:
+        return f"{local_url.rstrip('/')}/bot{BOT_TOKEN}"
+    return f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+
+async def _send_video_isolated(chat_id, path, caption, meta=None, thumb_path=None, timeout=300):
+    """Upload video via isolated curl subprocess. Each upload gets its own
+    process, so a hang/kill never corrupts the bot's httpx connection pool."""
+    api_url = _get_api_url()
+    cmd = [
+        "curl", "-s", "-X", "POST", f"{api_url}/sendVideo",
+        "--max-time", str(timeout),
+        "-F", f"chat_id={chat_id}",
+        "-F", f"video=@{path}",
+        "-F", "supports_streaming=true",
+    ]
+    if caption:
+        cmd.extend(["-F", f"caption={caption[:1024]}"])
+    if meta:
+        if meta.get("duration"):
+            cmd.extend(["-F", f"duration={meta['duration']}"])
+        if meta.get("width"):
+            cmd.extend(["-F", f"width={meta['width']}"])
+        if meta.get("height"):
+            cmd.extend(["-F", f"height={meta['height']}"])
+    if thumb_path and os.path.exists(thumb_path):
+        cmd.extend(["-F", f"thumbnail=@{thumb_path}"])
+
+    logger.info(f"curl upload: {os.path.basename(path)} -> sendVideo")
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout + 10)
+        output = stdout.decode(errors="replace").strip()
+        if proc.returncode != 0:
+            err = stderr.decode(errors="replace").strip()[:300]
+            raise Exception(f"curl failed (rc={proc.returncode}): {err}")
+        result = json.loads(output) if output else {}
+        if not result.get("ok"):
+            desc = result.get("description", output[:200])
+            raise Exception(f"Telegram API: {desc}")
+        return result
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.communicate()
+        except Exception:
+            pass
+        raise asyncio.TimeoutError(f"curl upload timed out after {timeout}s")
+    except Exception:
+        try:
+            proc.kill()
+            await proc.communicate()
+        except Exception:
+            pass
+        raise
+
+
+async def _send_photo_isolated(chat_id, path, caption, timeout=120):
+    """Upload photo via isolated curl subprocess."""
+    api_url = _get_api_url()
+    cmd = [
+        "curl", "-s", "-X", "POST", f"{api_url}/sendPhoto",
+        "--max-time", str(timeout),
+        "-F", f"chat_id={chat_id}",
+        "-F", f"photo=@{path}",
+    ]
+    if caption:
+        cmd.extend(["-F", f"caption={caption[:1024]}"])
+
+    logger.info(f"curl upload: {os.path.basename(path)} -> sendPhoto")
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout + 10)
+        output = stdout.decode(errors="replace").strip()
+        if proc.returncode != 0:
+            err = stderr.decode(errors="replace").strip()[:300]
+            raise Exception(f"curl failed (rc={proc.returncode}): {err}")
+        result = json.loads(output) if output else {}
+        if not result.get("ok"):
+            desc = result.get("description", output[:200])
+            raise Exception(f"Telegram API: {desc}")
+        return result
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.communicate()
+        except Exception:
+            pass
+        raise asyncio.TimeoutError(f"curl photo upload timed out after {timeout}s")
+    except Exception:
+        try:
+            proc.kill()
+            await proc.communicate()
+        except Exception:
+            pass
+        raise
+
+
 def dedupe_thumbnails(file_paths):
     videos = [fp for fp in file_paths if Path(fp).suffix.lower() in VIDEO_EXTS]
     images = [fp for fp in file_paths if Path(fp).suffix.lower() in IMAGE_EXTS]
@@ -1098,153 +1207,49 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             video_meta_cache = {}
             thumb_cache = {}
 
-            for i in range(0, len(prepared_items), 10):
-                group = prepared_items[i:i + 10]
+            for i, (path, kind) in enumerate(prepared_items):
+                file_mb = os.path.getsize(path) / (1024 * 1024)
+                upload_timeout = 300 if kind == "video" else 120
+                sent = False
 
-                if len(group) == 1:
-                    path, kind = group[0]
-                    file_mb = os.path.getsize(path) / (1024 * 1024)
+                for attempt in range(2):
                     try:
                         await safe_edit(status_msg, f"⬆️ رفع {i+1}/{len(prepared_items)} — {os.path.basename(path)} ({file_mb:.1f}MB)")
-                        with open(path, "rb") as f:
-                            if kind == "photo":
-                                await asyncio.wait_for(
-                                    context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption),
-                                    timeout=120,
+                        if kind == "photo":
+                            await _send_photo_isolated(chat_id, path, caption, timeout=120)
+                        else:
+                            if path not in video_meta_cache:
+                                video_meta_cache[path] = await loop.run_in_executor(
+                                    None, get_video_metadata, str(path)
                                 )
-                            else:
-                                if path not in video_meta_cache:
-                                    video_meta_cache[path] = await loop.run_in_executor(
-                                        None, get_video_metadata, str(path)
-                                    )
-                                meta = video_meta_cache[path]
-                                if path not in thumb_cache:
-                                    thumb_cache[path] = await loop.run_in_executor(
-                                        None, extract_thumbnail, str(path)
-                                    )
-                                thumb_path = thumb_cache.get(path)
-                                thumb_file = open(thumb_path, "rb") if thumb_path else None
-                                try:
-                                    await asyncio.wait_for(
-                                        context.bot.send_video(
-                                            chat_id=chat_id, video=f, caption=caption,
-                                            supports_streaming=True,
-                                            duration=meta.get("duration"),
-                                            width=meta.get("width"),
-                                            height=meta.get("height"),
-                                            thumbnail=thumb_file,
-                                        ),
-                                        timeout=120,
-                                    )
-                                finally:
-                                    if thumb_file:
-                                        thumb_file.close()
+                            meta = video_meta_cache[path]
+                            if path not in thumb_cache:
+                                thumb_cache[path] = await loop.run_in_executor(
+                                    None, extract_thumbnail, str(path)
+                                )
+                            thumb_path = thumb_cache.get(path)
+                            await _send_video_isolated(
+                                chat_id, path, caption,
+                                meta=meta, thumb_path=thumb_path, timeout=upload_timeout,
+                            )
                         logger.info(f"Sent {kind}: {os.path.basename(path)} ({file_mb:.1f}MB)")
+                        sent = True
+                        break
                     except asyncio.TimeoutError:
-                        logger.error(f"Send timed out for {path}")
-                        await safe_edit(status_msg, f"❌ رفع {os.path.basename(path)} ({file_mb:.1f}MB) أخد وقت طويل — تم تخطيه.")
+                        logger.error(f"Send timed out for {path} (attempt {attempt+1})")
+                        if attempt == 0:
+                            await safe_edit(status_msg, f"⚠️ رفع {os.path.basename(path)} ({file_mb:.1f}MB) علق — بجرب تاني...")
+                            await asyncio.sleep(2)
+                        else:
+                            await safe_edit(status_msg, f"❌ رفع {os.path.basename(path)} ({file_mb:.1f}MB) أخد وقت طويل — تم تخطيه.")
                     except Exception as e:
-                        logger.error(f"Send failed for {path}: {e}")
-                        await safe_edit(status_msg, f"❌ فشل إرسال {os.path.basename(path)} ({file_mb:.1f}MB): {str(e)[:150]}")
-                    finally:
-                        _cleanup_file(path)
-                    continue
-
-                media = []
-                file_handles = []
-                for idx, (path, kind) in enumerate(group):
-                    item_caption = caption if (i == 0 and idx == 0) else None
-                    if kind == "photo":
-                        fh = open(path, "rb")
-                        file_handles.append(fh)
-                        media.append(InputMediaPhoto(media=fh, caption=item_caption))
-                    else:
-                        if path not in video_meta_cache:
-                            video_meta_cache[path] = await loop.run_in_executor(
-                                None, get_video_metadata, str(path)
-                            )
-                        meta = video_meta_cache[path]
-                        if path not in thumb_cache:
-                            thumb_cache[path] = await loop.run_in_executor(
-                                None, extract_thumbnail, str(path)
-                            )
-                        thumb_path = thumb_cache.get(path)
-                        thumb_file = open(thumb_path, "rb") if thumb_path else None
-                        fh = open(path, "rb")
-                        file_handles.append(fh)
-                        if thumb_file:
-                            file_handles.append(thumb_file)
-                        try:
-                            media.append(InputMediaVideo(
-                                media=fh, caption=item_caption,
-                                supports_streaming=True,
-                                duration=meta.get("duration"),
-                                width=meta.get("width"),
-                                height=meta.get("height"),
-                                thumbnail=thumb_file,
-                            ))
-                        except Exception:
-                            pass
-                try:
-                    await asyncio.wait_for(
-                        context.bot.send_media_group(chat_id=chat_id, media=media),
-                        timeout=180,
-                    )
-                    logger.info(f"send_media_group sent {len(group)} item(s)")
-                except asyncio.TimeoutError:
-                    logger.error(f"send_media_group timed out for group starting at {i}")
-                    await safe_edit(status_msg, f"❌ رفع المجموعة ({len(group)} ملف) أخد وقت طويل — تم تخطيه.")
-                except Exception as e:
-                    logger.error(f"send_media_group failed: {e}, falling back to individual sends")
-                    for path, kind in group:
-                        try:
-                            file_mb = os.path.getsize(path) / (1024 * 1024)
-                            await safe_edit(status_msg, f"⬆️ رفع بديل — {os.path.basename(path)} ({file_mb:.1f}MB)")
-                            with open(path, "rb") as f:
-                                if kind == "photo":
-                                    await asyncio.wait_for(
-                                        context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption),
-                                        timeout=120,
-                                    )
-                                else:
-                                    if path not in video_meta_cache:
-                                        video_meta_cache[path] = await loop.run_in_executor(
-                                            None, get_video_metadata, str(path)
-                                        )
-                                    meta = video_meta_cache[path]
-                                    if path not in thumb_cache:
-                                        thumb_cache[path] = await loop.run_in_executor(
-                                            None, extract_thumbnail, str(path)
-                                        )
-                                    thumb_path = thumb_cache.get(path)
-                                    thumb_file = open(thumb_path, "rb") if thumb_path else None
-                                    try:
-                                        await asyncio.wait_for(
-                                            context.bot.send_video(
-                                                chat_id=chat_id, video=f, caption=caption,
-                                                supports_streaming=True,
-                                                duration=meta.get("duration"),
-                                                width=meta.get("width"),
-                                                height=meta.get("height"),
-                                                thumbnail=thumb_file,
-                                            ),
-                                            timeout=120,
-                                        )
-                                    finally:
-                                        if thumb_file:
-                                            thumb_file.close()
-                        except asyncio.TimeoutError:
-                            logger.error(f"Fallback send timed out for {path}")
-                        except Exception as e2:
-                            logger.error(f"Individual send failed for {path}: {e2}")
-                finally:
-                    for fh in file_handles:
-                        try:
-                            fh.close()
-                        except Exception:
-                            pass
-                    for path, _ in group:
-                        _cleanup_file(path)
+                        logger.error(f"Send failed for {path} (attempt {attempt+1}): {e}")
+                        if attempt == 0:
+                            await safe_edit(status_msg, f"⚠️ فشل {os.path.basename(path)} ({file_mb:.1f}MB) — بجرب تاني...")
+                            await asyncio.sleep(2)
+                        else:
+                            await safe_edit(status_msg, f"❌ فشل إرسال {os.path.basename(path)} ({file_mb:.1f}MB): {str(e)[:150]}")
+                _cleanup_file(path)
 
             await status_msg.delete()
 
