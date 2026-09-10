@@ -234,6 +234,26 @@ VIDEO_EXTS = ('.mp4', '.mkv', '.webm', '.mov')
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.gif', '.webp')
 
 
+def _cleanup_file(path):
+    """Delete a file and its thumbnails to free memory."""
+    try:
+        p = Path(path)
+        if p.exists():
+            p.unlink()
+        for ext in ('.jpg', '.webp', '.png', '.jpeg'):
+            thumb = p.with_suffix(ext)
+            if thumb.exists():
+                thumb.unlink()
+        for thumb in DOWNLOAD_DIR.glob(f"{p.stem}*"):
+            if thumb.is_file() and thumb != p:
+                try:
+                    thumb.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 def dedupe_thumbnails(file_paths):
     videos = [fp for fp in file_paths if Path(fp).suffix.lower() in VIDEO_EXTS]
     images = [fp for fp in file_paths if Path(fp).suffix.lower() in IMAGE_EXTS]
@@ -424,18 +444,51 @@ def download_image_ytdlp(image_url: str, download_path: Path, idx: int, progress
 
 def collect_carousel_urls(info: dict) -> list:
     urls = []
+
     edges = info.get("edge_sidecar_to_children", {}).get("edges", [])
-    logger.info(f"Carousel edges found: {len(edges)}")
-    for i, edge in enumerate(edges):
-        node = edge.get("node", {})
-        logger.info(f"Edge {i}: keys={list(node.keys())[:15]}")
-        for res in node.get("display_resources", []):
-            if isinstance(res, dict) and res.get("src"):
-                urls.append(res["src"])
-        img_versions = node.get("image_versions2", {})
-        for c in img_versions.get("candidates", []):
-            if isinstance(c, dict) and c.get("src"):
-                urls.append(c["src"])
+    if edges:
+        logger.info(f"Carousel edges found: {len(edges)}")
+        for i, edge in enumerate(edges):
+            node = edge.get("node", {})
+            logger.info(f"Edge {i}: keys={list(node.keys())[:15]}")
+            for res in node.get("display_resources", []):
+                if isinstance(res, dict) and res.get("src"):
+                    urls.append(res["src"])
+            img_versions = node.get("image_versions2", {})
+            for c in img_versions.get("candidates", []):
+                if isinstance(c, dict) and c.get("src"):
+                    urls.append(c["src"])
+
+    entries = info.get("entries", [])
+    if entries and not urls:
+        logger.info(f"Carousel entries found: {len(entries)}")
+        for i, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            entry_keys = list(entry.keys())[:15]
+            logger.info(f"Entry {i}: keys={entry_keys}")
+            for key in ("url", "webpage_url", "original_url"):
+                val = entry.get(key)
+                if isinstance(val, str) and val.startswith("http"):
+                    urls.append(val)
+            for key in ("thumbnail", "thumb", "display_url"):
+                val = entry.get(key)
+                if isinstance(val, str) and val.startswith("http"):
+                    urls.append(val)
+            for thumb in entry.get("thumbnails", []):
+                if isinstance(thumb, dict):
+                    for key in ("url", "src"):
+                        val = thumb.get(key)
+                        if isinstance(val, str) and val.startswith("http"):
+                            urls.append(val)
+            for res in entry.get("display_resources", []):
+                if isinstance(res, dict) and res.get("src"):
+                    urls.append(res["src"])
+            img_versions = entry.get("image_versions2", {})
+            for c in img_versions.get("candidates", []):
+                if isinstance(c, dict) and c.get("src"):
+                    urls.append(c["src"])
+
     logger.info(f"Carousel collected {len(urls)} URLs before dedupe")
     seen = set()
     result = []
@@ -453,6 +506,7 @@ def get_carousel_image_urls(url: str) -> list:
         "--no-download",
         "--no-warnings",
         "--no-check-certificates",
+        "--ignore-no-formats-error",
         "--extractor-retries", "3",
         "--retry-sleep", "1",
     ] + get_cookie_args() + [url]
@@ -508,7 +562,7 @@ def run_ytdlp_download(url: str, download_path: Path, is_carousel: bool, is_x: b
         "--ignore-no-formats-error",
         "--write-info-json",
         "--no-overwrites",
-        "--concurrent-fragments", "4",
+        "--concurrent-fragments", "2",
     ]
     if use_cookies:
         cmd_dl += get_cookie_args()
@@ -669,21 +723,12 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
     last_stderr = ""
 
     if is_x:
-        logger.info("X/Twitter: trying syndication API first (fast)")
-        x_urls = get_x_image_urls(url)
-        for u in x_urls:
-            if u not in all_image_urls:
-                all_image_urls.append(u)
-        logger.info(f"X syndication API returned: {len(all_image_urls)} URL(s)")
-
-        if not all_image_urls:
-            logger.info("X/Twitter: syndication API got nothing, falling back to yt-dlp")
-            if have_cookies_file:
-                logger.info("X/Twitter: using cookies")
-                last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=True)
-            else:
-                logger.info("X/Twitter: no cookies file, attempting without cookies")
-                last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=False)
+        if have_cookies_file:
+            logger.info("X/Twitter: using cookies")
+            last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=True)
+        else:
+            logger.info("X/Twitter: no cookies file, attempting without cookies")
+            last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=False)
     else:
         last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=True)
 
@@ -1085,6 +1130,8 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception as e:
                         logger.error(f"Send failed for {path}: {e}")
                         await safe_edit(status_msg, f"❌ فشل إرسال {os.path.basename(path)} ({file_mb:.1f}MB): {str(e)[:150]}")
+                    finally:
+                        _cleanup_file(path)
                     continue
 
                 media = []
@@ -1166,6 +1213,8 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             fh.close()
                         except Exception:
                             pass
+                    for path, _ in group:
+                        _cleanup_file(path)
 
             await status_msg.delete()
 
