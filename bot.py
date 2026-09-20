@@ -237,21 +237,25 @@ IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.gif', '.webp')
 
 
 def _cleanup_file(path):
-    """Delete a file and its thumbnails to free memory."""
+    """Delete a file and its thumbnails to free memory.
+    Only deletes the exact file and its direct thumbnail variants, NOT siblings."""
     try:
         p = Path(path)
         if p.exists():
             p.unlink()
         for ext in ('.jpg', '.webp', '.png', '.jpeg'):
-            thumb = p.with_suffix(ext)
+            thumb = p.with_suffix(p.suffix + ext)
             if thumb.exists():
                 thumb.unlink()
-        for thumb in DOWNLOAD_DIR.glob(f"{p.stem}*"):
-            if thumb.is_file() and thumb != p:
-                try:
-                    thumb.unlink()
-                except Exception:
-                    pass
+        thumb_direct = Path(str(p) + ".thumb.jpg")
+        if thumb_direct.exists():
+            thumb_direct.unlink()
+        compressed = Path(str(p) + ".compressed.mp4")
+        if compressed.exists():
+            compressed.unlink()
+        compressed_jpg = Path(str(p) + ".compressed.jpg")
+        if compressed_jpg.exists():
+            compressed_jpg.unlink()
     except Exception:
         pass
 
@@ -264,7 +268,7 @@ def _get_api_url():
     return f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
-async def _curl_upload(api_url, endpoint, path, extra_fields=None, timeout=300):
+async def _curl_upload(api_url, endpoint, path, extra_fields=None, timeout=300, thumb_path=None):
     """Run curl in a subprocess with EXPLICIT lifecycle management.
     Uses asyncio.wait (NOT wait_for) so we control the kill ourselves."""
     cmd = [
@@ -274,6 +278,8 @@ async def _curl_upload(api_url, endpoint, path, extra_fields=None, timeout=300):
         "--connect-timeout", "15",
         "-F", f"video=@{path}" if endpoint == "sendVideo" else f"photo=@{path}",
     ]
+    if thumb_path and os.path.exists(thumb_path):
+        cmd.extend(["-F", f"thumb=@{thumb_path}"])
     if extra_fields:
         for k, v in extra_fields.items():
             cmd.extend(["-F", f"{k}={v}"])
@@ -324,6 +330,8 @@ async def _send_video_isolated(chat_id, path, caption, meta=None, thumb_path=Non
             if meta.get(k):
                 fields[k] = str(meta[k])
     logger.info(f"[upload] sendVideo {os.path.basename(path)} timeout={timeout}s")
+    if thumb_path and os.path.exists(thumb_path):
+        return await _curl_upload(api_url, "sendVideo", path, extra_fields=fields, timeout=timeout, thumb_path=thumb_path)
     return await _curl_upload(api_url, "sendVideo", path, extra_fields=fields, timeout=timeout)
 
 
@@ -447,11 +455,15 @@ def collect_image_urls(info: dict) -> list:
 
 
 def extract_thumbnail(video_path: str) -> str | None:
-    """Extract a single frame thumbnail from a video via ffmpeg."""
+    """Extract a single frame thumbnail from a video via ffmpeg.
+    Seeks to 25% of the video to avoid white/black intro screens."""
     thumb_path = video_path + ".thumb.jpg"
     try:
+        duration = get_video_duration(video_path)
+        seek_pos = max(1, int(duration * 0.25)) if duration > 4 else 1
+        seek_str = f"{seek_pos:02d}:{0:02d}:{0:02d}"
         result = subprocess.run(
-            ["ffmpeg", "-y", "-i", video_path, "-ss", "00:00:01",
+            ["ffmpeg", "-y", "-i", video_path, "-ss", seek_str,
              "-vframes", "1", "-q:v", "3", thumb_path],
             capture_output=True, text=True, timeout=30
         )
@@ -1252,7 +1264,17 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
 
     logger.info("Bot started")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    import time
+    while True:
+        try:
+            application.run_polling(allowed_updates=Update.ALL_TYPES)
+        except Exception as e:
+            logger.error(f"Bot polling crashed: {e} — restarting in 5s...")
+            time.sleep(5)
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user")
+            break
 
 
 if __name__ == "__main__":
