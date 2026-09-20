@@ -276,10 +276,12 @@ async def _curl_upload(api_url, endpoint, path, extra_fields=None, timeout=300, 
         f"{api_url}/{endpoint}",
         "--max-time", str(timeout),
         "--connect-timeout", "15",
-        "-F", f"video=@{path}" if endpoint == "sendVideo" else f"photo=@{path}",
     ]
-    if thumb_path and os.path.exists(thumb_path):
+    if thumb_path and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
         cmd.extend(["-F", f"thumb=@{thumb_path}"])
+        logger.info(f"[upload] attaching thumbnail {os.path.basename(thumb_path)} ({os.path.getsize(thumb_path)} bytes)")
+    file_field = "video" if endpoint == "sendVideo" else "photo"
+    cmd.extend(["-F", f"{file_field}=@{path}"])
     if extra_fields:
         for k, v in extra_fields.items():
             cmd.extend(["-F", f"{k}={v}"])
@@ -456,21 +458,72 @@ def collect_image_urls(info: dict) -> list:
 
 def extract_thumbnail(video_path: str) -> str | None:
     """Extract a single frame thumbnail from a video via ffmpeg.
-    Seeks to 25% of the video to avoid white/black intro screens."""
+    Tries multiple positions: 25%, 10%, 50%, 75%, 1s to avoid white/black frames.
+    Resizes to Telegram limits: JPEG, <200KB, <900px."""
     thumb_path = video_path + ".thumb.jpg"
+    raw_thumb = video_path + ".thumb.raw.jpg"
     try:
         duration = get_video_duration(video_path)
-        seek_pos = max(1, int(duration * 0.25)) if duration > 4 else 1
-        seek_str = f"{seek_pos:02d}:{0:02d}:{0:02d}"
-        result = subprocess.run(
-            ["ffmpeg", "-y", "-i", video_path, "-ss", seek_str,
-             "-vframes", "1", "-q:v", "3", thumb_path],
-            capture_output=True, text=True, timeout=30
+        logger.info(f"Thumbnail: video duration={duration}s for {os.path.basename(video_path)}")
+        positions = []
+        if duration > 4:
+            positions = [int(duration * 0.25), int(duration * 0.10), int(duration * 0.50), int(duration * 0.75)]
+        else:
+            positions = [1]
+        found = False
+        for seek_pos in positions:
+            seek_pos = max(1, seek_pos)
+            seek_str = f"{seek_pos // 3600:02d}:{(seek_pos % 3600) // 60:02d}:{seek_pos % 60:02d}"
+            try:
+                result = subprocess.run(
+                    ["ffmpeg", "-y", "-ss", seek_str, "-i", video_path,
+                     "-vframes", "1", "-q:v", "3", raw_thumb],
+                    capture_output=True, text=True, timeout=30
+                )
+                if result.returncode == 0 and os.path.exists(raw_thumb) and os.path.getsize(raw_thumb) > 100:
+                    logger.info(f"Thumbnail extracted at {seek_str} ({os.path.getsize(raw_thumb)} bytes)")
+                    found = True
+                    break
+                else:
+                    logger.warning(f"Thumbnail at {seek_str} failed: rc={result.returncode}")
+            except Exception as e:
+                logger.warning(f"Thumbnail seek {seek_str} error: {e}")
+        if not found:
+            return None
+
+        # Resize to Telegram limits: JPEG, max 900px width, under 200KB
+        resize_result = subprocess.run(
+            ["ffmpeg", "-y", "-i", raw_thumb,
+             "-vf", "scale='min(900,iw)':'-2':flags=lanczos",
+             "-q:v", "3", thumb_path],
+            capture_output=True, text=True, timeout=15
         )
-        if result.returncode == 0 and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+        if resize_result.returncode != 0 or not os.path.exists(thumb_path):
+            # Fallback: use raw thumbnail
+            if os.path.exists(raw_thumb):
+                os.replace(raw_thumb, thumb_path)
+        else:
+            if os.path.exists(raw_thumb):
+                os.remove(raw_thumb)
+
+        # If still over 200KB, compress more
+        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 200 * 1024:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", thumb_path,
+                 "-vf", "scale='min(640,iw)':'-2':flags=lanczos",
+                 "-q:v", "5", thumb_path + ".small.jpg"],
+                capture_output=True, text=True, timeout=15
+            )
+            if os.path.exists(thumb_path + ".small.jpg"):
+                os.replace(thumb_path + ".small.jpg", thumb_path)
+
+        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+            logger.info(f"Thumbnail final: {os.path.getsize(thumb_path)} bytes")
             return thumb_path
     except Exception as e:
         logger.warning(f"Thumbnail extraction failed: {e}")
+        if os.path.exists(raw_thumb):
+            os.remove(raw_thumb)
     return None
 
 
