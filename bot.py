@@ -1291,12 +1291,12 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     unique_items.append((path, kind))
             all_items = unique_items
 
+            sent = False
             if len(all_items) > 1:
                 # Send as media group
                 sent = await send_media_group_isolated(context.bot, chat_id, all_items, caption)
                 if not sent:
                     logger.warning("Media group send failed, falling back to individual sends")
-                    sent = False
 
             if not sent:
                 # Fallback: send individually (photos first, then videos)
