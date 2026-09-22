@@ -564,6 +564,10 @@ def download_image_ytdlp(image_url: str, download_path: Path, idx: int, progress
             return str(fpath)
         logger.warning("Direct CDN download failed, falling back to yt-dlp")
 
+    # Determine platform for proper headers
+    is_tiktok = "tiktok.com" in image_url or "tiktokcdn.com" in image_url
+    is_instagram = "instagram.com" in image_url or "cdninstagram.com" in image_url or "fbcdn.net" in image_url
+
     cmd = [
         "yt-dlp",
         "--no-warnings",
@@ -573,17 +577,25 @@ def download_image_ytdlp(image_url: str, download_path: Path, idx: int, progress
         "--no-overwrites",
         "--no-write-info-json",
         "--legacy-server-connect",
-    ] + get_cookie_args() + [
-        "-o", str(fpath),
-        image_url,
     ]
+    if is_tiktok or is_instagram:
+        # Add proper headers for TikTok/Instagram
+        cmd += [
+            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "--referer", "https://www.tiktok.com/" if is_tiktok else "https://www.instagram.com/",
+        ]
+    cmd += get_cookie_args() + ["-o", str(fpath), image_url]
+
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if proc.returncode != 0 and proc.stderr.strip():
             logger.error(f"Download stderr: {proc.stderr.strip()[:500]}")
     except Exception as e:
         logger.error(f"Download exception: {e}")
-        return None
+    for f in download_path.iterdir():
+        if f.name.startswith(f"{idx:05d}.") and f.is_file() and not f.name.endswith(".info.json") and f.stat().st_size > 0:
+            return str(f)
+    return None
     for f in download_path.iterdir():
         if f.name.startswith(f"{idx:05d}.") and f.is_file() and not f.name.endswith(".info.json") and f.stat().st_size > 0:
             return str(f)
@@ -761,14 +773,14 @@ def get_tiktok_image_urls(url: str) -> list:
                 if urls:
                     logger.info(f"TikTok JSON: {len(urls)} image URL(s)")
                     return urls
-                for key in ["images", "image_urls", "image_list"]:
+                for key in ["images", "image_urls", "image_list", "image_post", "cover"]:
                     val = data.get(key)
                     if isinstance(val, list):
                         for item in val:
                             if isinstance(item, str) and item.startswith("http"):
                                 urls.append(item)
                             elif isinstance(item, dict):
-                                for uk in ["url", "src", "download_url"]:
+                                for uk in ["url", "src", "download_url", "display_url", "uri"]:
                                     if uk in item and isinstance(item[uk], str):
                                         urls.append(item[uk])
                                         break
@@ -899,11 +911,14 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
     is_tiktok = "tiktok.com" in url_lower or "vm.tiktok.com" in url_lower
 
     if is_carousel and not all_image_urls:
-        carousel_urls = get_carousel_image_urls(url)
-        for u in carousel_urls:
-            if u not in all_image_urls:
-                all_image_urls.append(u)
-        logger.info(f"After carousel fetch: {len(all_image_urls)} image URL(s)")
+        if is_tiktok:
+            logger.info("TikTok: skipping Instagram carousel extractor, using TikTok extractor")
+        else:
+            carousel_urls = get_carousel_image_urls(url)
+            for u in carousel_urls:
+                if u not in all_image_urls:
+                    all_image_urls.append(u)
+            logger.info(f"After carousel fetch: {len(all_image_urls)} image URL(s)")
 
     if is_tiktok and not all_image_urls:
         logger.info("TikTok: no images from info files, trying --dump-single-json")
