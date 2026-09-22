@@ -347,7 +347,7 @@ async def _send_photo_isolated(chat_id, path, caption, timeout=120):
     return await _curl_upload(api_url, "sendPhoto", path, extra_fields=fields, timeout=timeout)
 
 
-async def send_media_group_isolated(chat_id, media_list, caption=""):
+async def send_media_group_isolated(bot, chat_id, media_list, caption=""):
     """Send a media group (album) of photos/videos in one message.
     media_list: list of (path, kind) tuples where kind is 'photo' or 'video'"""
     from telegram import InputMediaPhoto, InputMediaVideo
@@ -379,7 +379,7 @@ async def send_media_group_isolated(chat_id, media_list, caption=""):
         return False
 
     try:
-        await context.bot.send_media_group(chat_id=chat_id, media=grouped_media)
+        await bot.send_media_group(chat_id=chat_id, media=grouped_media)
         return True
     except TelegramError as e:
         logger.error(f"Failed to send media group: {e}")
@@ -1297,7 +1297,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if len(all_items) > 1:
                 # Send as media group
-                sent = await send_media_group_isolated(chat_id, all_items, caption)
+                sent = await send_media_group_isolated(context.bot, chat_id, all_items, caption)
                 if not sent:
                     logger.warning("Media group send failed, falling back to individual sends")
                     sent = False
