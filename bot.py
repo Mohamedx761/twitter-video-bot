@@ -353,27 +353,23 @@ async def send_media_group_isolated(bot, chat_id, media_list, caption=""):
     from telegram import InputMediaPhoto, InputMediaVideo
 
     grouped_media = []
-    photo_count = 0
-    video_count = 0
+    total_count = 0
+    max_items = 10  # Telegram limit
 
     for path, kind in media_list:
+        if total_count >= max_items:
+            break
+        if not os.path.exists(path):
+            continue
         if kind == "photo":
-            if photo_count >= 10:
-                break
-            if not os.path.exists(path):
-                continue
-            media = InputMediaPhoto(media=InputFile(path), caption=caption if photo_count == 0 else None)
-            grouped_media.append(media)
-            photo_count += 1
+            media = InputMediaPhoto(media=InputFile(path), caption=caption if total_count == 0 else None)
         elif kind == "video":
-            if video_count >= 10:
-                break
-            if not os.path.exists(path):
-                continue
-            # Videos can't have caption in media group (only first one can)
+            # Videos in media group don't show caption (Telegram limitation)
             media = InputMediaVideo(media=InputFile(path))
-            grouped_media.append(media)
-            video_count += 1
+        else:
+            continue
+        grouped_media.append(media)
+        total_count += 1
 
     if not grouped_media:
         return False
