@@ -347,6 +347,45 @@ async def _send_photo_isolated(chat_id, path, caption, timeout=120):
     return await _curl_upload(api_url, "sendPhoto", path, extra_fields=fields, timeout=timeout)
 
 
+async def send_media_group_isolated(chat_id, media_list, caption=""):
+    """Send a media group (album) of photos/videos in one message.
+    media_list: list of (path, kind) tuples where kind is 'photo' or 'video'"""
+    from telegram import InputMediaPhoto, InputMediaVideo
+
+    grouped_media = []
+    photo_count = 0
+    video_count = 0
+
+    for path, kind in media_list:
+        if kind == "photo":
+            if photo_count >= 10:
+                break
+            if not os.path.exists(path):
+                continue
+            media = InputMediaPhoto(media=InputFile(path), caption=caption if photo_count == 0 else None)
+            grouped_media.append(media)
+            photo_count += 1
+        elif kind == "video":
+            if video_count >= 10:
+                break
+            if not os.path.exists(path):
+                continue
+            # Videos can't have caption in media group (only first one can)
+            media = InputMediaVideo(media=InputFile(path))
+            grouped_media.append(media)
+            video_count += 1
+
+    if not grouped_media:
+        return False
+
+    try:
+        await context.bot.send_media_group(chat_id=chat_id, media=grouped_media)
+        return True
+    except TelegramError as e:
+        logger.error(f"Failed to send media group: {e}")
+        return False
+
+
 def dedupe_thumbnails(file_paths):
     videos = [fp for fp in file_paths if Path(fp).suffix.lower() in VIDEO_EXTS]
     images = [fp for fp in file_paths if Path(fp).suffix.lower() in IMAGE_EXTS]
@@ -653,8 +692,10 @@ def collect_carousel_urls(info: dict) -> list:
     seen = set()
     result = []
     for u in urls:
-        if u not in seen:
-            seen.add(u)
+        # Normalize: strip query params and fragments for dedupe
+        norm = u.split("?")[0].split("#")[0]
+        if norm not in seen:
+            seen.add(norm)
             result.append(u)
     return result
 
@@ -1237,43 +1278,96 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         video_meta_cache = {}
         thumb_cache = {}
 
-        for i, (path, kind) in enumerate(prepared_items):
-            if cancelled_downloads.get(chat_id):
-                await safe_edit(status_msg, "تم الإلغاء.")
-                break
+        # Prepare media lists for media group sending
+        photo_items = [(path, kind) for path, kind in prepared_items if kind == "photo"]
+        video_items = [(path, kind) for path, kind in prepared_items if kind == "video"]
 
-            file_mb = os.path.getsize(path) / (1024 * 1024)
-            upload_timeout = 300 if kind == "video" else 120
+        # Try to send as media group first
+        if len(photo_items) > 1 or len(video_items) > 0:
+            # Combine photo and video items, photos first, then videos
+            all_items = photo_items + video_items
+            # Remove duplicates by path
+            seen_paths = set()
+            unique_items = []
+            for path, kind in all_items:
+                if path not in seen_paths:
+                    seen_paths.add(path)
+                    unique_items.append((path, kind))
+            all_items = unique_items
 
-            for attempt in range(2):
-                try:
-                    await safe_edit(status_msg, f"⬆️ رفع {i+1}/{len(prepared_items)} — {os.path.basename(path)} ({file_mb:.1f}MB)")
-                    if kind == "photo":
+            if len(all_items) > 1:
+                # Send as media group
+                sent = await send_media_group_isolated(chat_id, all_items, caption)
+                if not sent:
+                    logger.warning("Media group send failed, falling back to individual sends")
+                    sent = False
+
+            if not sent:
+                # Fallback: send individually (photos first, then videos)
+                for path, kind in photo_items:
+                    if cancelled_downloads.get(chat_id):
+                        await safe_edit(status_msg, "تم الإلغاء.")
+                        break
+                    try:
                         await _send_photo_isolated(chat_id, path, caption, timeout=120)
-                    else:
+                        _cleanup_file(path)
+                    except Exception as e:
+                        logger.error(f"Failed to send photo: {e}")
+                        _cleanup_file(path)
+                for path, kind in video_items:
+                    if cancelled_downloads.get(chat_id):
+                        await safe_edit(status_msg, "تم الإلغاء.")
+                        break
+                    try:
                         if path not in video_meta_cache:
                             video_meta_cache[path] = await loop.run_in_executor(None, get_video_metadata, str(path))
                         meta = video_meta_cache[path]
                         if path not in thumb_cache:
                             thumb_cache[path] = await loop.run_in_executor(None, extract_thumbnail, str(path))
-                        await _send_video_isolated(chat_id, path, caption, meta=meta, thumb_path=thumb_cache.get(path), timeout=upload_timeout)
-                    logger.info(f"Sent {kind}: {os.path.basename(path)} ({file_mb:.1f}MB)")
+                        await _send_video_isolated(chat_id, path, caption, meta=meta, thumb_path=thumb_cache.get(path), timeout=300)
+                        _cleanup_file(path)
+                    except Exception as e:
+                        logger.error(f"Failed to send video: {e}")
+                        _cleanup_file(path)
+        else:
+            # Single item - send individually
+            for path, kind in prepared_items:
+                if cancelled_downloads.get(chat_id):
+                    await safe_edit(status_msg, "تم الإلغاء.")
                     break
-                except asyncio.TimeoutError:
-                    logger.error(f"Send timed out for {path} (attempt {attempt+1})")
-                    if attempt == 0:
-                        await safe_edit(status_msg, f"⚠️ رفع {os.path.basename(path)} ({file_mb:.1f}MB) علق — بجرب تاني...")
-                        await asyncio.sleep(2)
-                    else:
-                        await safe_edit(status_msg, f"❌ رفع {os.path.basename(path)} ({file_mb:.1f}MB) أخد وقت طويل — تم تخطيه.")
-                except Exception as e:
-                    logger.error(f"Send failed for {path} (attempt {attempt+1}): {e}")
-                    if attempt == 0:
-                        await safe_edit(status_msg, f"⚠️ فشل {os.path.basename(path)} ({file_mb:.1f}MB) — بجرب تاني...")
-                        await asyncio.sleep(2)
-                    else:
-                        await safe_edit(status_msg, f"❌ فشل إرسال {os.path.basename(path)} ({file_mb:.1f}MB): {str(e)[:150]}")
-            _cleanup_file(path)
+
+                file_mb = os.path.getsize(path) / (1024 * 1024)
+                upload_timeout = 300 if kind == "video" else 120
+
+                for attempt in range(2):
+                    try:
+                        await safe_edit(status_msg, f"⬆️ رفع {prepared_items.index((path, kind))+1}/{len(prepared_items)} — {os.path.basename(path)} ({file_mb:.1f}MB)")
+                        if kind == "photo":
+                            await _send_photo_isolated(chat_id, path, caption, timeout=120)
+                        else:
+                            if path not in video_meta_cache:
+                                video_meta_cache[path] = await loop.run_in_executor(None, get_video_metadata, str(path))
+                            meta = video_meta_cache[path]
+                            if path not in thumb_cache:
+                                thumb_cache[path] = await loop.run_in_executor(None, extract_thumbnail, str(path))
+                            await _send_video_isolated(chat_id, path, caption, meta=meta, thumb_path=thumb_cache.get(path), timeout=upload_timeout)
+                        logger.info(f"Sent {kind}: {os.path.basename(path)} ({file_mb:.1f}MB)")
+                        break
+                    except asyncio.TimeoutError:
+                        logger.error(f"Send timed out for {path} (attempt {attempt+1})")
+                        if attempt == 0:
+                            await safe_edit(status_msg, f"⚠️ رفع {os.path.basename(path)} ({file_mb:.1f}MB) علق — بجرب تاني...")
+                            await asyncio.sleep(2)
+                        else:
+                            await safe_edit(status_msg, f"❌ رفع {os.path.basename(path)} ({file_mb:.1f}MB) أخد وقت طويل — تم تخطيه.")
+                    except Exception as e:
+                        logger.error(f"Send failed for {path} (attempt {attempt+1}): {e}")
+                        if attempt == 0:
+                            await safe_edit(status_msg, f"⚠️ فشل {os.path.basename(path)} ({file_mb:.1f}MB) — بجرب تاني...")
+                            await asyncio.sleep(2)
+                        else:
+                            await safe_edit(status_msg, f"❌ فشل إرسال {os.path.basename(path)} ({file_mb:.1f}MB): {str(e)[:150]}")
+                _cleanup_file(path)
 
         try:
             await status_msg.delete()
