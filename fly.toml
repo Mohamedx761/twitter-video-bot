@@ -1,0 +1,28 @@
+app = "twitter-video-bot"
+primary_region = "fra"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  USE_LOCAL_SERVER = "true"
+  LOCAL_API_URL = "http://localhost:8081"
+  DOWNLOAD_DIR = "/data/downloads"
+
+[mounts]
+  source = "bot_data"
+  destination = "/data"
+
+[processes]
+  app = "./entrypoint.sh"
+
+[[services]]
+  internal_port = 8081
+  protocol = "tcp"
+  # Local Bot API Server - internal only for the app
+
+[services.ports]
+  # لا ports عامة للبوت (webhook/polling مش محتاج port)
+
+[experimental]
+  auto_rollback = true

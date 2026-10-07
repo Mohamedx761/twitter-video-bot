@@ -6,7 +6,7 @@ echo "[entrypoint] Starting Telegram Bot API Server..."
 telegram-bot-api \
     --api-id="${TELEGRAM_API_ID}" \
     --api-hash="${TELEGRAM_API_HASH}" \
-    --http-port=8081 \
+    --http-port=7860 \
     --local \
     --dir=/var/lib/telegram-bot-api \
     --temp-dir=/tmp/telegram-bot-api \
@@ -15,16 +15,16 @@ telegram-bot-api \
 SERVER_PID=$!
 echo "[entrypoint] Server PID: $SERVER_PID"
 
-echo "[entrypoint] Waiting for server on port 8081..."
+echo "[entrypoint] Waiting for server on port 7860..."
 RETRIES=0
 MAX_RETRIES=30
 while [ $RETRIES -lt $MAX_RETRIES ]; do
-    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8081/ 2>/dev/null || true)
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:7860/ 2>/dev/null || true)
     case "$HTTP_CODE" in
         200|404)
             echo "[entrypoint] Server is ready!"
             export USE_LOCAL_SERVER="true"
-            export LOCAL_API_URL="http://localhost:8081"
+            export LOCAL_API_URL="http://localhost:7860"
             echo "[entrypoint] Starting bot..."
             exec python3 -u bot.py
             ;;

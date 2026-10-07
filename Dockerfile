@@ -19,6 +19,6 @@ COPY cookies.txt .
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
 
-EXPOSE 8081
+EXPOSE 7860
 
 ENTRYPOINT ["./entrypoint.sh"]
