@@ -775,8 +775,17 @@ def get_carousel_image_urls(url: str) -> list:
     return []
 
 
-def run_ytdlp_download(url: str, download_path: Path, is_carousel: bool, is_x: bool, use_cookies: bool) -> str:
-    """Run one yt-dlp download attempt. Returns stderr text for diagnostics."""
+def run_ytdlp_download(
+    url: str,
+    download_path: Path,
+    is_carousel: bool,
+    is_x: bool,
+    use_cookies: bool,
+    progress: dict = None,
+    timeout: int = 60,
+) -> str:
+    """Run yt-dlp download attempt with streaming output and timeout.
+    Returns stderr text for diagnostics."""
     cmd_dl = [
         "yt-dlp",
         "--no-warnings",
@@ -785,31 +794,80 @@ def run_ytdlp_download(url: str, download_path: Path, is_carousel: bool, is_x: b
         "--write-info-json",
         "--no-overwrites",
         "--concurrent-fragments", "2",
-        "--socket-timeout", "20",
-        "--retries", "3",
+        "--socket-timeout", "15",
+        "--retries", "2",
+        "--newline",
+        "--progress-template", "download:%(progress._percent_str)s of %(progress._total_bytes_str)s",
     ]
     if use_cookies:
         cmd_dl += get_cookie_args()
     cmd_dl += ["-o", str(download_path / "%(autonumber)s_%(id)s.%(ext)s")]
     if is_x:
         cmd_dl += [
-            "--verbose",
-            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "--user-agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         ]
     if not is_carousel:
         cmd_dl.append("--no-playlist")
     cmd_dl.append(url)
 
+    logger.info(f"Running yt-dlp (cookies={use_cookies}, timeout={timeout}s) for {url}")
+    start_t = time.time()
+    stderr_chunks = []
+
     try:
-        proc = subprocess.run(cmd_dl, capture_output=True, text=True, timeout=180)
-        stderr = proc.stderr or ""
-        if stderr.strip():
-            logger.error(f"yt-dlp stderr (cookies={use_cookies}): {stderr.strip()[:1000]}")
-        return stderr
-    except subprocess.TimeoutExpired:
-        raise ValueError("التحميل أخد وقت طويل (أكثر من 3 دقائق). جرب تاني أو تأكد إن اللنك شغال.")
+        proc = subprocess.Popen(
+            cmd_dl,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
     except FileNotFoundError:
-        raise ValueError("yt-dlp not found.")
+        raise ValueError("أداة التحميل yt-dlp غير مثبتة على السيرفر.")
+
+    def _read_stdout():
+        for line in iter(proc.stdout.readline, ''):
+            if not line:
+                break
+            line_s = line.strip()
+            if line_s.startswith("download:"):
+                pct = line_s.replace("download:", "").strip()
+                if progress is not None and pct:
+                    progress["msg"] = f"⏳ جاري التحميل: {pct}"
+
+    def _read_stderr():
+        for line in iter(proc.stderr.readline, ''):
+            if not line:
+                break
+            stderr_chunks.append(line)
+
+    t_out = threading.Thread(target=_read_stdout, daemon=True)
+    t_err = threading.Thread(target=_read_stderr, daemon=True)
+    t_out.start()
+    t_err.start()
+
+    while proc.poll() is None:
+        if time.time() - start_t > timeout:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            logger.warning(f"yt-dlp killed after {timeout}s timeout for {url}")
+            t_out.join(timeout=1)
+            t_err.join(timeout=1)
+            raise ValueError(f"استغرق التحميل وقتاً طويلاً (تجاوز {timeout} ثانية وتوقف).")
+        time.sleep(0.5)
+
+    t_out.join(timeout=2)
+    t_err.join(timeout=2)
+
+    stderr = "".join(stderr_chunks)
+    if stderr.strip():
+        logger.info(f"yt-dlp stderr (cookies={use_cookies}): {stderr.strip()[:600]}")
+    return stderr
+
 
 
 def get_tiktok_image_urls(url: str) -> list:
@@ -946,15 +1004,30 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
     info = {}
     last_stderr = ""
 
-    if is_x:
-        if have_cookies_file:
-            logger.info("X/Twitter: using cookies")
-            last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=True)
-        else:
-            logger.info("X/Twitter: no cookies file, attempting without cookies")
-            last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=False)
+    if have_cookies_file:
+        logger.info(f"Attempting download with cookies (is_x={is_x})...")
+        try:
+            last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=True, progress=progress, timeout=60)
+        except Exception as e:
+            logger.warning(f"Download with cookies failed: {e}")
+            last_stderr = str(e)
+
+        # Check if any media was downloaded
+        after_files = set(f.name for f in download_path.iterdir() if f.is_file() and not f.name.endswith(".info.json"))
+        if not (after_files - before_files):
+            logger.info("No media found using cookies. Retrying WITHOUT cookies as fallback...")
+            try:
+                last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=False, progress=progress, timeout=60)
+            except Exception as e:
+                logger.warning(f"Fallback download without cookies failed: {e}")
+                last_stderr = str(e)
     else:
-        last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=True)
+        logger.info(f"Attempting download without cookies (is_x={is_x})...")
+        try:
+            last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=False, progress=progress, timeout=60)
+        except Exception as e:
+            logger.warning(f"Download without cookies failed: {e}")
+            last_stderr = str(e)
 
     for f in sorted(download_path.glob("*.info.json")):
         try:
@@ -991,10 +1064,6 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
             if u not in all_image_urls:
                 all_image_urls.append(u)
         logger.info(f"After TikTok fetch: {len(all_image_urls)} image URL(s)")
-
-    if not is_x:
-        after_ytdlp_files = set(f.name for f in download_path.iterdir() if f.is_file() and not f.name.endswith(".info.json"))
-        x_got_media = bool(after_ytdlp_files - before_files)
 
     image_urls = all_image_urls
     logger.info(f"Final image URL(s): {len(image_urls)}")
@@ -1041,26 +1110,26 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
     downloaded_files = dedupe_thumbnails(downloaded_files)
 
     if not downloaded_files:
-        if is_x:
-            if have_cookies_file:
-                tail = (last_stderr or "").strip().splitlines()
-                hint = tail[-1] if tail else ""
-                raise ValueError(
-                    "فشل التحميل من X حتى مع الكوكيز.\n\n"
-                    f"السبب المحتمل: {hint[:200]}\n\n"
-                    "جرب:\n"
-                    "1. الكوكيز ممكن تكون منتهية — اعمل Export جديد وابعته بـ /cookies\n"
-                    "2. حدّث yt-dlp لآخر إصدار: pip install -U yt-dlp"
-                )
-            tail = (last_stderr or "").strip().splitlines()
-            hint = tail[-1] if tail else ""
-            raise ValueError(
-                f"التحميل من X فشل.\n\n"
-                f"سبب yt-dlp: {hint[:200]}\n\n"
-                "لو البوست عام وطبيعي، جرب تاني بعد شوية.\n"
-                "لو المشكلة مستمرة، ابعت كوكيز بالأمر /cookies"
+        tail = (last_stderr or "").strip().splitlines()
+        hint = tail[-1] if tail else ""
+        if "No video could be found" in hint or "no suitable formats" in hint.lower():
+            reason = "تعذر العثور على ميديا في هذا الرابط (قد يكون المنشور نصياً فقط، أو الحساب خاص، أو تم حذف الفيديو)."
+        elif "Private video" in hint or "login required" in hint.lower() or "requires authentication" in hint.lower():
+            reason = "هذا المحتوى خاص أو يتطلب تسجيل الدخول لمشاهدته."
+        elif "Rate-limit" in hint or "429" in hint:
+            reason = "تم تجاوز حد الطلبات المسموح به من الموقع مؤقتاً. يرجى المحاولة بعد قليل."
+        elif "404" in hint or "not found" in hint.lower():
+            reason = "الرابط غير موجود أو تم حذف المنشور من قِبل صاحبه."
+        elif is_x:
+            reason = (
+                "تعذر استخراج الفيديو من X (تويتر).\n"
+                f"السبب: {hint[:150] if hint else 'لم يتم العثور على ميديا'}\n"
+                "لو المحتوى خاص أو مقيد بالعمر، يمكنك إرسال كوكيز جديدة عبر /cookies"
             )
-        raise ValueError("No media found in this post. The post may be private or require login.")
+        else:
+            reason = f"تعذر استخراج الميديا من الرابط.\n{hint[:150]}" if hint else "تعذر استخراج الميديا من هذا الرابط."
+
+        raise ValueError(reason)
 
     return info, downloaded_files
 
@@ -1199,10 +1268,28 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async def safe_edit(msg, text):
         async with _edit_lock:
-            try:
-                await msg.edit_text(text)
-            except TelegramError:
-                pass
+            for _ in range(2):
+                try:
+                    await msg.edit_text(text)
+                    return True
+                except telegram.error.RetryAfter as ra:
+                    await asyncio.sleep(ra.retry_after + 0.5)
+                except telegram.error.BadRequest as br:
+                    if "Message is not modified" in str(br):
+                        return True
+                    break
+                except TelegramError:
+                    break
+            return False
+
+    async def notify_stopped(reason: str):
+        """Notify user clearly via status edit AND an explicit new reply that the download has stopped."""
+        full_msg = f"🛑 توقف التحميل:\n{reason}"
+        await safe_edit(status_msg, full_msg)
+        try:
+            await update.message.reply_text(full_msg)
+        except Exception as e:
+            logger.error(f"Failed to send stop notification reply: {e}")
 
     try:
         async with _download_semaphore:
@@ -1210,22 +1297,25 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 async with _queue_lock:
                     _waiting_count = max(0, _waiting_count - 1)
                 queued = False
-                await safe_edit(status_msg, "⏳ جاري التحميل...")
+                await safe_edit(status_msg, "⏳ جاري التحميل... (0ث)")
 
             if status_id in cancelled_downloads:
-                await safe_edit(status_msg, "تم الإلغاء.")
+                await notify_stopped("تم إلغاء التحميل بناءً على طلبك.")
                 return
 
             progress = {"msg": ""}
+            start_t = time.time()
 
             async def _poll_progress():
                 last = ""
                 while True:
                     await asyncio.sleep(2)
+                    elapsed = int(time.time() - start_t)
                     cur = progress.get("msg", "")
-                    if cur and cur != last:
-                        last = cur
-                        await safe_edit(status_msg, cur)
+                    display = f"{cur} ({elapsed}ث)" if cur else f"⏳ جاري التحميل... ({elapsed}ث)"
+                    if display != last:
+                        last = display
+                        await safe_edit(status_msg, display)
 
             poll_task = asyncio.ensure_future(_poll_progress())
             try:
@@ -1233,10 +1323,10 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     loop.run_in_executor(
                         None, extract_media, url, req_dir, chat_id, status_id, context.application, progress
                     ),
-                    timeout=300,
+                    timeout=140,
                 )
             except asyncio.TimeoutError:
-                await safe_edit(status_msg, "❌ التحميل أخد وقت طويل — اللنك ده اتقف عليه.")
+                await notify_stopped("استغرق التحميل وقتاً طويلاً (تجاوزت المهلة دقيقتين) وتوقف.")
                 return
             finally:
                 poll_task.cancel()
@@ -1246,11 +1336,11 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
 
             if status_id in cancelled_downloads:
-                await safe_edit(status_msg, "تم الإلغاء.")
+                await notify_stopped("تم إلغاء التحميل.")
                 return
 
             if not file_paths:
-                await safe_edit(status_msg, "❌ مفيش ميديا في البوست ده.")
+                await notify_stopped("تعذر العثور على أي ملفات ميديا قابلة للتحميل في هذا الرابط.")
                 return
 
             caption = (info or {}).get("description", "") or (info or {}).get("title", "") or ""
@@ -1285,23 +1375,15 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     continue
                 file_mb = os.path.getsize(video_path) / (1024 * 1024)
                 if file_mb > upload_limit_mb:
-                    if use_local:
-                        await safe_edit(status_msg, f"❌ الفيديو {file_mb:.0f}MB — كبير جداً للـ Local Server.")
-                        return
-                    cpath = str(video_path) + ".compressed.mp4"
-                    try:
-                        compressed = await loop.run_in_executor(None, compress_video, video_path, cpath, 49.0)
-                        prepared_items.append((cpath if compressed and os.path.exists(cpath) else video_path, "video"))
-                    except ValueError as ve:
-                        await safe_edit(status_msg, f"❌ {ve}")
-                        return
+                    await notify_stopped(f"حجم الفيديو ({file_mb:.1f}MB) كبير جداً ويتجاوز الحد الأقصى ({upload_limit_mb}MB).")
+                    return
                 elif not use_local and file_mb > 50:
                     cpath = str(video_path) + ".compressed.mp4"
                     try:
                         compressed = await loop.run_in_executor(None, compress_video, video_path, cpath, 49.0)
                         prepared_items.append((cpath if compressed and os.path.exists(cpath) else video_path, "video"))
                     except ValueError as ve:
-                        await safe_edit(status_msg, f"❌ {ve}")
+                        await notify_stopped(str(ve))
                         return
                 else:
                     if use_local:
@@ -1310,13 +1392,15 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             video_meta_cache = {}
             thumb_cache = {}
+            successful_sends = 0
+            last_upload_error = ""
 
-            # Prepare media lists for media group sending
             photo_items = [(path, kind) for path, kind in prepared_items if kind == "photo"]
             video_items = [(path, kind) for path, kind in prepared_items if kind == "video"]
 
-            # Try to send as media group first
-            if len(photo_items) > 1 or len(video_items) > 0:
+            # Try to send as media group first if multiple items
+            sent_group = False
+            if len(photo_items) > 1 or (len(photo_items) >= 1 and len(video_items) >= 1) or len(video_items) > 1:
                 all_items = photo_items + video_items
                 seen_paths = set()
                 unique_items = []
@@ -1324,52 +1408,29 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if path not in seen_paths:
                         seen_paths.add(path)
                         unique_items.append((path, kind))
-                all_items = unique_items
+                if len(unique_items) > 1:
+                    try:
+                        sent_group = await send_media_group_isolated(context.bot, chat_id, unique_items, caption)
+                        if sent_group:
+                            successful_sends = len(unique_items)
+                            for path, _ in unique_items:
+                                _cleanup_file(path)
+                    except Exception as e:
+                        logger.warning(f"Media group send failed: {e}")
+                        last_upload_error = str(e)
 
-                sent = False
-                if len(all_items) > 1:
-                    sent = await send_media_group_isolated(context.bot, chat_id, all_items, caption)
-                    if not sent:
-                        logger.warning("Media group send failed, falling back to individual sends")
-
-                if not sent:
-                    for path, kind in photo_items:
-                        if status_id in cancelled_downloads:
-                            await safe_edit(status_msg, "تم الإلغاء.")
-                            break
-                        try:
-                            await _send_photo_isolated(chat_id, path, caption, timeout=120)
-                            _cleanup_file(path)
-                        except Exception as e:
-                            logger.error(f"Failed to send photo: {e}")
-                            _cleanup_file(path)
-                    for path, kind in video_items:
-                        if status_id in cancelled_downloads:
-                            await safe_edit(status_msg, "تم الإلغاء.")
-                            break
-                        try:
-                            if path not in video_meta_cache:
-                                video_meta_cache[path] = await loop.run_in_executor(None, get_video_metadata, str(path))
-                            meta = video_meta_cache[path]
-                            if path not in thumb_cache:
-                                thumb_cache[path] = await loop.run_in_executor(None, extract_thumbnail, str(path))
-                            await _send_video_isolated(chat_id, path, caption, meta=meta, thumb_path=thumb_cache.get(path), timeout=300)
-                            _cleanup_file(path)
-                        except Exception as e:
-                            logger.error(f"Failed to send video: {e}")
-                            _cleanup_file(path)
-            else:
-                for path, kind in prepared_items:
+            if not sent_group:
+                for idx, (path, kind) in enumerate(prepared_items):
                     if status_id in cancelled_downloads:
-                        await safe_edit(status_msg, "تم الإلغاء.")
+                        await notify_stopped("تم إلغاء التحميل.")
                         break
 
-                    file_mb = os.path.getsize(path) / (1024 * 1024)
+                    file_mb = os.path.getsize(path) / (1024 * 1024) if os.path.exists(path) else 0
                     upload_timeout = 300 if kind == "video" else 120
 
                     for attempt in range(2):
                         try:
-                            await safe_edit(status_msg, f"⬆️ رفع {prepared_items.index((path, kind))+1}/{len(prepared_items)} — {os.path.basename(path)} ({file_mb:.1f}MB)")
+                            await safe_edit(status_msg, f"⬆️ رفع {idx+1}/{len(prepared_items)} — {os.path.basename(path)} ({file_mb:.1f}MB)")
                             if kind == "photo":
                                 await _send_photo_isolated(chat_id, path, caption, timeout=120)
                             else:
@@ -1380,41 +1441,39 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     thumb_cache[path] = await loop.run_in_executor(None, extract_thumbnail, str(path))
                                 await _send_video_isolated(chat_id, path, caption, meta=meta, thumb_path=thumb_cache.get(path), timeout=upload_timeout)
                             logger.info(f"Sent {kind}: {os.path.basename(path)} ({file_mb:.1f}MB)")
+                            successful_sends += 1
                             break
                         except asyncio.TimeoutError:
+                            last_upload_error = f"انتهت مهلة إرسال الملف ({file_mb:.1f}MB)"
                             logger.error(f"Send timed out for {path} (attempt {attempt+1})")
                             if attempt == 0:
-                                await safe_edit(status_msg, f"⚠️ رفع {os.path.basename(path)} ({file_mb:.1f}MB) علق — بجرب تاني...")
+                                await safe_edit(status_msg, f"⚠️ رفع {os.path.basename(path)} علق — بجرب تاني...")
                                 await asyncio.sleep(2)
-                            else:
-                                await safe_edit(status_msg, f"❌ رفع {os.path.basename(path)} ({file_mb:.1f}MB) أخد وقت طويل — تم تخطيه.")
                         except Exception as e:
+                            last_upload_error = str(e)
                             logger.error(f"Send failed for {path} (attempt {attempt+1}): {e}")
                             if attempt == 0:
-                                await safe_edit(status_msg, f"⚠️ فشل {os.path.basename(path)} ({file_mb:.1f}MB) — بجرب تاني...")
+                                await safe_edit(status_msg, f"⚠️ فشل {os.path.basename(path)} — بجرب تاني...")
                                 await asyncio.sleep(2)
-                            else:
-                                await safe_edit(status_msg, f"❌ فشل إرسال {os.path.basename(path)} ({file_mb:.1f}MB): {str(e)[:150]}")
                     _cleanup_file(path)
 
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
+            if successful_sends > 0:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                if successful_sends < len(prepared_items):
+                    await update.message.reply_text(f"⚠️ تم إرسال {successful_sends} من أصل {len(prepared_items)} ملفات (تعذر إرسال الباقي).")
+            else:
+                await notify_stopped(f"تعذر إرسال الملفات إلى تيليجرام:\n{last_upload_error[:150] if last_upload_error else 'حدث خطأ أثناء الإرسال'}")
 
     except asyncio.TimeoutError:
         logger.error(f"Timeout processing {url}")
-        try:
-            await safe_edit(status_msg, "❌ العملية أخدت وقت طويل — اللنك ده اتقف عليه.")
-        except Exception:
-            pass
+        await notify_stopped("استغرقت العملية وقتاً طويلاً وتوقفت.")
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Error processing {url}: {error_msg}")
-        try:
-            await safe_edit(status_msg, f"❌ فشل التحميل:\n{error_msg[:200]}")
-        except Exception:
-            pass
+        await notify_stopped(error_msg)
     finally:
         if queued:
             async with _queue_lock:
