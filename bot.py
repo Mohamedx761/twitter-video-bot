@@ -6,6 +6,8 @@ import subprocess
 import json
 import hashlib
 import urllib.request
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, InputMediaVideo, InputFile
@@ -164,11 +166,31 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
-async def safe_edit(msg, text):
-    try:
-        await msg.edit_text(text)
-    except TelegramError:
+class SimpleHealthServer(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Twitter Video Bot is running successfully!\n")
+
+    def log_message(self, format, *args):
         pass
+
+
+def start_health_check_server():
+    port_str = os.getenv("PORT", "10000").strip()
+    try:
+        port = int(port_str)
+    except ValueError:
+        port = 10000
+
+    try:
+        server = HTTPServer(("0.0.0.0", port), SimpleHealthServer)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        logger.info(f"Health check HTTP server running on port {port}")
+    except Exception as e:
+        logger.warning(f"Could not start health check HTTP server on port {port}: {e}")
 
 cancelled_downloads = {}
 _download_semaphore = asyncio.Semaphore(1)
@@ -1421,6 +1443,7 @@ def main():
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
 
+    start_health_check_server()
     logger.info("Bot started")
 
     import time
