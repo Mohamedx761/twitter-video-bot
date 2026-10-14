@@ -32,7 +32,7 @@ AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0").strip().strip('"')
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads").strip().strip('"').strip("'"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip().strip('"').strip("'")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-BOT_VERSION = "v2.2-album"
+BOT_VERSION = "v2.3-albums-photos-and-videos"
 
 
 def get_video_duration(path: str) -> float:
@@ -374,8 +374,8 @@ async def _send_photo_isolated(chat_id, path, caption, timeout=120):
     return await _curl_upload(api_url, "sendPhoto", path, extra_fields=fields, timeout=timeout)
 
 
-async def _curl_upload_media_group(chat_id, media_items, caption="", timeout=300):
-    """Upload an album (2-10 items) via curl directly to Telegram Bot API."""
+async def _curl_upload_media_group(chat_id, media_items, caption="", timeout=300, thumb_map=None, meta_map=None):
+    """Upload an album (2-10 items of photos, videos, or mixed) via curl directly to Telegram Bot API."""
     if len(media_items) < 2:
         return False
 
@@ -396,6 +396,22 @@ async def _curl_upload_media_group(chat_id, media_items, caption="", timeout=300
         }
         if idx == 0 and caption:
             item["caption"] = caption[:1024]
+
+        if kind == "video":
+            item["supports_streaming"] = True
+            if meta_map and path in meta_map and meta_map[path]:
+                meta = meta_map[path]
+                for mk in ("duration", "width", "height"):
+                    if meta.get(mk):
+                        try:
+                            item[mk] = int(meta[mk])
+                        except (ValueError, TypeError):
+                            pass
+            if thumb_map and path in thumb_map and thumb_map[path] and os.path.exists(thumb_map[path]):
+                thumb_key = f"thumb_{idx}"
+                item["thumbnail"] = f"attach://{thumb_key}"
+                cmd.extend(["-F", f"{thumb_key}=@{thumb_map[path]}"])
+
         media_json.append(item)
         cmd.extend(["-F", f"{key}=@{path}"])
 
@@ -437,7 +453,7 @@ async def _curl_upload_media_group(chat_id, media_items, caption="", timeout=300
     return True
 
 
-async def send_media_group_isolated(bot, chat_id, media_list, caption=""):
+async def send_media_group_isolated(bot, chat_id, media_list, caption="", thumb_map=None, meta_map=None):
     """Send a media group (album) of photos/videos in one message.
     media_list: list of (path, kind) tuples where kind is 'photo' or 'video'"""
     if len(media_list) < 2:
@@ -445,7 +461,7 @@ async def send_media_group_isolated(bot, chat_id, media_list, caption=""):
 
     # Attempt 1: Isolated curl (handles local server, large files, streaming without RAM bloat)
     try:
-        ok = await _curl_upload_media_group(chat_id, media_list, caption)
+        ok = await _curl_upload_media_group(chat_id, media_list, caption, thumb_map=thumb_map, meta_map=meta_map)
         if ok:
             return True
     except Exception as e:
@@ -465,7 +481,23 @@ async def send_media_group_isolated(bot, chat_id, media_list, caption=""):
             if kind == "photo":
                 grouped_media.append(InputMediaPhoto(media=fh, caption=item_caption))
             elif kind == "video":
-                grouped_media.append(InputMediaVideo(media=fh, caption=item_caption))
+                thumb_fh = None
+                if thumb_map and path in thumb_map and thumb_map[path] and os.path.exists(thumb_map[path]):
+                    try:
+                        thumb_fh = open(thumb_map[path], "rb")
+                        file_handles.append(thumb_fh)
+                    except Exception:
+                        thumb_fh = None
+                meta = meta_map.get(path) if meta_map else None
+                grouped_media.append(InputMediaVideo(
+                    media=fh,
+                    caption=item_caption,
+                    supports_streaming=True,
+                    thumbnail=thumb_fh,
+                    duration=int(meta["duration"]) if meta and meta.get("duration") else None,
+                    width=int(meta["width"]) if meta and meta.get("width") else None,
+                    height=int(meta["height"]) if meta and meta.get("height") else None,
+                ))
 
         if len(grouped_media) >= 2:
             await bot.send_media_group(chat_id=chat_id, media=grouped_media)
@@ -1317,11 +1349,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Send me a link and I will download it.\n\n"
         "Supported:\n"
-        "- X/Twitter videos and images (Albums enabled 📸)\n"
+        "- X/Twitter videos and images (Photo & Video Albums 📸🎬)\n"
         "- Instagram posts, reels, stories\n"
         "- Facebook videos and reels\n"
         "- TikTok videos\n\n"
-        f"🤖 الإصدار النشط: {BOT_VERSION} (ميزة تجميع ألبوم الصور مفعلة 📸)",
+        f"🤖 الإصدار النشط: {BOT_VERSION} (ميزة تجميع ألبومات الصور والفيديوهات مفعلة 📸🎬)",
         reply_markup=start_keyboard,
     )
 
@@ -1575,17 +1607,25 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             photo_items = [(path, kind) for path, kind in prepared_items if kind == "photo"]
             video_items = [(path, kind) for path, kind in prepared_items if kind == "video"]
 
-            # Try to send as media group first if multiple items
+            # Try to send as media group first if multiple items (photos, videos, or mixed)
             sent_group = False
-            if len(photo_items) > 1 or (len(photo_items) >= 1 and len(video_items) >= 1) or len(video_items) > 1:
-                all_items = photo_items + video_items
+            if len(prepared_items) > 1:
                 seen_paths = set()
                 unique_items = []
-                for path, kind in all_items:
-                    if path not in seen_paths:
+                for path, kind in prepared_items:
+                    if path not in seen_paths and os.path.exists(path):
                         seen_paths.add(path)
                         unique_items.append((path, kind))
+
                 if len(unique_items) > 1:
+                    # Pre-extract video metadata and thumbnails for album items
+                    for path, kind in unique_items:
+                        if kind == "video":
+                            if path not in video_meta_cache:
+                                video_meta_cache[path] = await loop.run_in_executor(None, get_video_metadata, str(path))
+                            if path not in thumb_cache:
+                                thumb_cache[path] = await loop.run_in_executor(None, extract_thumbnail, str(path))
+
                     chunk_size = 10
                     all_chunks_sent = True
                     for i in range(0, len(unique_items), chunk_size):
@@ -1596,7 +1636,9 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 if kind == "photo":
                                     await _send_photo_isolated(chat_id, path, caption if i == 0 else "", timeout=120)
                                 else:
-                                    await _send_video_isolated(chat_id, path, caption if i == 0 else "", timeout=300)
+                                    meta = video_meta_cache.get(path)
+                                    thumb = thumb_cache.get(path)
+                                    await _send_video_isolated(chat_id, path, caption if i == 0 else "", meta=meta, thumb_path=thumb, timeout=300)
                                 successful_sends += 1
                                 _cleanup_file(path)
                             except Exception as e:
@@ -1605,7 +1647,10 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 all_chunks_sent = False
                         else:
                             try:
-                                group_ok = await send_media_group_isolated(context.bot, chat_id, chunk, caption if i == 0 else "")
+                                group_ok = await send_media_group_isolated(
+                                    context.bot, chat_id, chunk, caption if i == 0 else "",
+                                    thumb_map=thumb_cache, meta_map=video_meta_cache
+                                )
                                 if group_ok:
                                     successful_sends += len(chunk)
                                     for path, _ in chunk:
