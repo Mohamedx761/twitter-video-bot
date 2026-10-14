@@ -32,6 +32,7 @@ AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0").strip().strip('"')
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads").strip().strip('"').strip("'"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip().strip('"').strip("'")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+BOT_VERSION = "v2.2-album"
 
 
 def get_video_duration(path: str) -> float:
@@ -1316,10 +1317,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Send me a link and I will download it.\n\n"
         "Supported:\n"
-        "- X/Twitter videos and images\n"
+        "- X/Twitter videos and images (Albums enabled 📸)\n"
         "- Instagram posts, reels, stories\n"
         "- Facebook videos and reels\n"
-        "- TikTok videos",
+        "- TikTok videos\n\n"
+        f"🤖 الإصدار النشط: {BOT_VERSION} (ميزة تجميع ألبوم الصور مفعلة 📸)",
         reply_markup=start_keyboard,
     )
 
