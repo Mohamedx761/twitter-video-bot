@@ -439,14 +439,33 @@ async def _curl_upload_media_group(chat_id, media_items, caption="", timeout=300
 
     stdout, stderr = comm_task.result()
     output = stdout.decode(errors="replace").strip()
-    if proc.returncode not in (0, None):
-        err = stderr.decode(errors="replace").strip()[:300]
-        logger.error(f"sendMediaGroup curl failed rc={proc.returncode}: {err}")
-        return False
-
     result = json.loads(output) if output else {}
-    if not result.get("ok"):
-        logger.error(f"sendMediaGroup Telegram error: {result.get('description', output[:200])}")
+
+    if proc.returncode not in (0, None) or not result.get("ok"):
+        err_desc = result.get('description', output[:200]) if result else (stderr.decode(errors="replace").strip()[:300])
+        logger.warning(f"sendMediaGroup failed on {api_url}: {err_desc}")
+        if "localhost" in api_url or "127.0.0.1" in api_url:
+            cloud_url = f"https://api.telegram.org/bot{BOT_TOKEN}"
+            logger.info("Retrying sendMediaGroup directly via official Telegram Cloud API...")
+            cmd_cloud = list(cmd)
+            for ci, carg in enumerate(cmd_cloud):
+                if f"{api_url}/sendMediaGroup" in carg:
+                    cmd_cloud[ci] = f"{cloud_url}/sendMediaGroup"
+            try:
+                proc2 = await asyncio.create_subprocess_exec(
+                    *cmd_cloud,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout2, _ = await asyncio.wait_for(proc2.communicate(), timeout=timeout)
+                out2 = stdout2.decode(errors="replace").strip()
+                res2 = json.loads(out2) if out2 else {}
+                if res2.get("ok"):
+                    logger.info(f"[upload] sendMediaGroup succeeded via Cloud API ({len(media_items)} items)")
+                    return True
+                logger.error(f"Cloud API retry failed: {res2.get('description', out2[:200])}")
+            except Exception as e:
+                logger.error(f"Cloud API retry exception: {e}")
         return False
 
     logger.info(f"[upload] sendMediaGroup succeeded with {len(media_items)} items")
