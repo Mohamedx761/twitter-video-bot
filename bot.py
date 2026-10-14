@@ -373,39 +373,113 @@ async def _send_photo_isolated(chat_id, path, caption, timeout=120):
     return await _curl_upload(api_url, "sendPhoto", path, extra_fields=fields, timeout=timeout)
 
 
+async def _curl_upload_media_group(chat_id, media_items, caption="", timeout=300):
+    """Upload an album (2-10 items) via curl directly to Telegram Bot API."""
+    if len(media_items) < 2:
+        return False
+
+    api_url = _get_api_url()
+    cmd = [
+        "curl", "-s", "-S", "-X", "POST",
+        f"{api_url}/sendMediaGroup",
+        "--max-time", str(timeout),
+        "--connect-timeout", "20",
+        "-F", f"chat_id={chat_id}",
+    ]
+    media_json = []
+    for idx, (path, kind) in enumerate(media_items[:10]):
+        key = f"file_{idx}"
+        item = {
+            "type": "photo" if kind == "photo" else "video",
+            "media": f"attach://{key}",
+        }
+        if idx == 0 and caption:
+            item["caption"] = caption[:1024]
+        media_json.append(item)
+        cmd.extend(["-F", f"{key}=@{path}"])
+
+    cmd.extend(["-F", f"media={json.dumps(media_json)}"])
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    logger.info(f"[upload] started curl sendMediaGroup ({len(media_items)} items) pid={proc.pid}")
+
+    comm_task = asyncio.ensure_future(proc.communicate())
+    done, pending = await asyncio.wait([comm_task], timeout=timeout)
+
+    if pending:
+        logger.warning(f"[upload] TIMEOUT after {timeout}s — killing curl sendMediaGroup pid={proc.pid}")
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await asyncio.wait(pending, timeout=5)
+        comm_task.cancel()
+        raise asyncio.TimeoutError(f"Upload media group timed out after {timeout}s")
+
+    stdout, stderr = comm_task.result()
+    output = stdout.decode(errors="replace").strip()
+    if proc.returncode not in (0, None):
+        err = stderr.decode(errors="replace").strip()[:300]
+        logger.error(f"sendMediaGroup curl failed rc={proc.returncode}: {err}")
+        return False
+
+    result = json.loads(output) if output else {}
+    if not result.get("ok"):
+        logger.error(f"sendMediaGroup Telegram error: {result.get('description', output[:200])}")
+        return False
+
+    logger.info(f"[upload] sendMediaGroup succeeded with {len(media_items)} items")
+    return True
+
+
 async def send_media_group_isolated(bot, chat_id, media_list, caption=""):
     """Send a media group (album) of photos/videos in one message.
     media_list: list of (path, kind) tuples where kind is 'photo' or 'video'"""
-    from telegram import InputMediaPhoto, InputMediaVideo
-
-    grouped_media = []
-    total_count = 0
-    max_items = 10  # Telegram limit
-
-    for path, kind in media_list:
-        if total_count >= max_items:
-            break
-        if not os.path.exists(path):
-            continue
-        if kind == "photo":
-            media = InputMediaPhoto(media=InputFile(path), caption=caption if total_count == 0 else None)
-        elif kind == "video":
-            # Videos in media group don't show caption (Telegram limitation)
-            media = InputMediaVideo(media=InputFile(path))
-        else:
-            continue
-        grouped_media.append(media)
-        total_count += 1
-
-    if not grouped_media:
+    if len(media_list) < 2:
         return False
 
+    # Attempt 1: Isolated curl (handles local server, large files, streaming without RAM bloat)
     try:
-        await bot.send_media_group(chat_id=chat_id, media=grouped_media)
-        return True
-    except TelegramError as e:
-        logger.error(f"Failed to send media group: {e}")
-        return False
+        ok = await _curl_upload_media_group(chat_id, media_list, caption)
+        if ok:
+            return True
+    except Exception as e:
+        logger.warning(f"Curl media group upload failed, trying python-telegram-bot fallback: {e}")
+
+    # Attempt 2: python-telegram-bot fallback with properly opened binary files
+    from telegram import InputMediaPhoto, InputMediaVideo
+    file_handles = []
+    try:
+        grouped_media = []
+        for idx, (path, kind) in enumerate(media_list[:10]):
+            if not os.path.exists(path):
+                continue
+            fh = open(path, "rb")
+            file_handles.append(fh)
+            item_caption = caption if idx == 0 and caption else None
+            if kind == "photo":
+                grouped_media.append(InputMediaPhoto(media=fh, caption=item_caption))
+            elif kind == "video":
+                grouped_media.append(InputMediaVideo(media=fh, caption=item_caption))
+
+        if len(grouped_media) >= 2:
+            await bot.send_media_group(chat_id=chat_id, media=grouped_media)
+            logger.info(f"python-telegram-bot send_media_group succeeded with {len(grouped_media)} items")
+            return True
+    except Exception as e:
+        logger.error(f"python-telegram-bot send_media_group failed: {e}")
+    finally:
+        for fh in file_handles:
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+    return False
 
 
 def dedupe_thumbnails(file_paths):
@@ -1510,18 +1584,45 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         seen_paths.add(path)
                         unique_items.append((path, kind))
                 if len(unique_items) > 1:
-                    try:
-                        sent_group = await send_media_group_isolated(context.bot, chat_id, unique_items, caption)
-                        if sent_group:
-                            successful_sends = len(unique_items)
-                            for path, _ in unique_items:
+                    chunk_size = 10
+                    all_chunks_sent = True
+                    for i in range(0, len(unique_items), chunk_size):
+                        chunk = unique_items[i:i + chunk_size]
+                        if len(chunk) == 1:
+                            path, kind = chunk[0]
+                            try:
+                                if kind == "photo":
+                                    await _send_photo_isolated(chat_id, path, caption if i == 0 else "", timeout=120)
+                                else:
+                                    await _send_video_isolated(chat_id, path, caption if i == 0 else "", timeout=300)
+                                successful_sends += 1
                                 _cleanup_file(path)
-                    except Exception as e:
-                        logger.warning(f"Media group send failed: {e}")
-                        last_upload_error = str(e)
+                            except Exception as e:
+                                logger.warning(f"Single item send failed: {e}")
+                                last_upload_error = str(e)
+                                all_chunks_sent = False
+                        else:
+                            try:
+                                group_ok = await send_media_group_isolated(context.bot, chat_id, chunk, caption if i == 0 else "")
+                                if group_ok:
+                                    successful_sends += len(chunk)
+                                    for path, _ in chunk:
+                                        _cleanup_file(path)
+                                else:
+                                    all_chunks_sent = False
+                                    break
+                            except Exception as e:
+                                logger.warning(f"Media group send failed: {e}")
+                                last_upload_error = str(e)
+                                all_chunks_sent = False
+                                break
+                    if all_chunks_sent and successful_sends > 0:
+                        sent_group = True
 
             if not sent_group:
                 for idx, (path, kind) in enumerate(prepared_items):
+                    if not os.path.exists(path):
+                        continue
                     if status_id in cancelled_downloads:
                         await notify_stopped("تم إلغاء التحميل.")
                         break
