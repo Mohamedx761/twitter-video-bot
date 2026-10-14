@@ -1436,12 +1436,27 @@ def main():
     local_url = os.getenv("LOCAL_API_URL", "").strip()
 
     if use_local and local_url:
-        builder = builder.base_url(f"{local_url}/bot")
-        builder = builder.base_file_url(f"{local_url}/file/bot")
-        builder = builder.connect_timeout(30)
-        builder = builder.read_timeout(300)
-        builder = builder.write_timeout(300)
-        logger.info(f"Using LOCAL Bot API Server at {local_url} (2GB upload limit)")
+        server_alive = False
+        try:
+            req = urllib.request.Request(f"{local_url}/", method="GET")
+            with urllib.request.urlopen(req, timeout=3):
+                server_alive = True
+        except urllib.error.HTTPError:
+            server_alive = True
+        except Exception as e:
+            logger.warning(f"Local server check failed ({e}) — falling back to official Telegram Cloud API")
+            server_alive = False
+
+        if server_alive:
+            builder = builder.base_url(f"{local_url}/bot")
+            builder = builder.base_file_url(f"{local_url}/file/bot")
+            builder = builder.connect_timeout(30)
+            builder = builder.read_timeout(300)
+            builder = builder.write_timeout(300)
+            logger.info(f"Using LOCAL Bot API Server at {local_url} (2GB upload limit)")
+        else:
+            os.environ["USE_LOCAL_SERVER"] = "false"
+            logger.info("Using Telegram Cloud API (50MB limit) + ffmpeg compression")
     else:
         logger.info("Using Telegram Cloud API (50MB limit) + ffmpeg compression")
 
