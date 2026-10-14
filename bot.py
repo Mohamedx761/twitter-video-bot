@@ -16,11 +16,13 @@ from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, InputMediaVideo, InputFile
 from telegram.error import TelegramError
+import sqlite3
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    ChatMemberHandler,
     filters,
     ContextTypes,
 )
@@ -32,7 +34,113 @@ AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0").strip().strip('"')
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads").strip().strip('"').strip("'"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip().strip('"').strip("'")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-BOT_VERSION = "v2.3-albums-photos-and-videos"
+BOT_VERSION = "v2.4-channel-archive-anti-duplicate"
+
+DB_PATH = Path("archive.db")
+
+def init_db():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS archive (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    post_id TEXT UNIQUE,
+                    platform TEXT,
+                    source_url TEXT,
+                    channel_msg_id INTEGER DEFAULT 0,
+                    caption TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            conn.commit()
+            logger.info("Archive database initialized successfully")
+    except Exception as e:
+        logger.error(f"init_db failed: {e}")
+
+def get_canonical_post_id(url: str) -> tuple[str, str]:
+    """Returns unique (post_id, platform_name) to reliably detect duplicates."""
+    clean_url = url.split("?")[0].rstrip("/")
+    m = re.search(r"(?:x|twitter)\.com/[^/]+/status/(\d+)", url, re.I)
+    if m:
+        return f"x_{m.group(1)}", "X_Twitter"
+    m = re.search(r"instagram\.com/(?:p|reel|tv|stories)/([A-Za-z0-9_-]+)", url, re.I)
+    if m:
+        return f"ig_{m.group(1)}", "Instagram"
+    m = re.search(r"tiktok\.com/@[^/]+/video/(\d+)", url, re.I)
+    if m:
+        return f"tt_{m.group(1)}", "TikTok"
+    m = re.search(r"vm\.tiktok\.com/([A-Za-z0-9_-]+)", url, re.I)
+    if m:
+        return f"tt_{m.group(1)}", "TikTok"
+    m = re.search(r"(?:facebook|fb)\.com/.*/(?:videos|posts|reel)/(\d+)", url, re.I)
+    if m:
+        return f"fb_{m.group(1)}", "Facebook"
+    return "url_" + hashlib.sha256(clean_url.encode()).hexdigest()[:20], "Media"
+
+def is_post_archived(post_id: str) -> dict | None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute("SELECT * FROM archive WHERE post_id = ?", (post_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+    except Exception as e:
+        logger.error(f"is_post_archived error: {e}")
+        return None
+
+def save_archive_item(post_id: str, platform: str, source_url: str, channel_msg_id: int = 0, caption: str = ""):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO archive (post_id, platform, source_url, channel_msg_id, caption) VALUES (?, ?, ?, ?, ?)",
+                (post_id, platform, source_url, channel_msg_id, (caption or "")[:1000])
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"save_archive_item error: {e}")
+
+def get_archive_channel():
+    env_ch = os.getenv("ARCHIVE_CHANNEL_ID", "").strip()
+    if env_ch:
+        try:
+            return int(env_ch)
+        except ValueError:
+            return env_ch
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.execute("SELECT value FROM settings WHERE key = 'archive_channel_id'")
+            row = cur.fetchone()
+            if row and row[0]:
+                try:
+                    return int(row[0])
+                except ValueError:
+                    return row[0]
+    except Exception as e:
+        logger.error(f"get_archive_channel error: {e}")
+    return None
+
+def set_archive_channel(channel_id, channel_title=""):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('archive_channel_id', ?)",
+                (str(channel_id),)
+            )
+            if channel_title:
+                conn.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES ('archive_channel_title', ?)",
+                    (str(channel_title),)
+                )
+            conn.commit()
+            logger.info(f"Archive channel set to {channel_title} ({channel_id})")
+    except Exception as e:
+        logger.error(f"set_archive_channel error: {e}")
 
 
 def get_video_duration(path: str) -> float:
@@ -1365,6 +1473,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Bot is for personal use only.")
         return
+    arch_ch = get_archive_channel()
+    arch_status = f"قناة الأرشيف: <code>{arch_ch}</code> ✅" if arch_ch else "قناة الأرشيف: غير مربوطة (حول أي رسالة من قناتك لربطها تلقائياً)"
     await update.message.reply_text(
         "Send me a link and I will download it.\n\n"
         "Supported:\n"
@@ -1372,9 +1482,62 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- Instagram posts, reels, stories\n"
         "- Facebook videos and reels\n"
         "- TikTok videos\n\n"
-        f"🤖 الإصدار النشط: {BOT_VERSION} (ميزة تجميع ألبومات الصور والفيديوهات مفعلة 📸🎬)",
+        f"🤖 الإصدار النشط: {BOT_VERSION}\n"
+        f"📁 {arch_status}",
+        parse_mode="HTML",
         reply_markup=start_keyboard,
     )
+
+
+async def archive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id):
+        return
+    current_ch = get_archive_channel()
+    if context.args:
+        raw_id = context.args[0].strip()
+        try:
+            ch_id = int(raw_id)
+            set_archive_channel(ch_id, f"Channel {ch_id}")
+            await update.message.reply_text(f"✅ تم ضبط قناة الأرشيف بنجاح: <code>{ch_id}</code>", parse_mode="HTML")
+        except ValueError:
+            await update.message.reply_text("يرجى إرسال معرف صالح للقناة (مثال: -1001234567890)")
+        return
+    if current_ch:
+        await update.message.reply_text(
+            f"📁 <b>قناة الأرشيف الحالية:</b> <code>{current_ch}</code> ✅\n\n"
+            "لربط قناة جديدة:\n"
+            "1. ضيف البوت كـ مشرف (Admin) في قناتك مع صلاحية إرسال الرسائل.\n"
+            "2. حول (Forward) أي رسالة من القناة إلى هنا مباشرة وسيرتبط تلقائياً!",
+            parse_mode="HTML"
+        )
+    else:
+        await update.message.reply_text(
+            "📁 <b>لم يتم ربط قناة أرشيف بعد!</b>\n\n"
+            "<b>طريقة الربط في ثواني:</b>\n"
+            "1. ضيف البوت كـ مشرف (Admin) في قناتك مع صلاحية إرسال الرسائل.\n"
+            "2. أعد توجيه (Forward) أي رسالة من القناة إلى هنا وسيقوم البوت بالربط فوراً!\n"
+            "أو اكتب: <code>/channel -100xxxxxxxxxx</code> مع وضع ID القناة.",
+            parse_mode="HTML"
+        )
+
+
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.my_chat_member:
+        return
+    chat = update.my_chat_member.chat
+    new_member = update.my_chat_member.new_chat_member
+    if chat.type in ("channel", "supergroup") and new_member.status in ("administrator", "creator"):
+        set_archive_channel(chat.id, chat.title or "Archive Channel")
+        logger.info(f"Bot added as admin to channel: {chat.title} ({chat.id})")
+        if AUTHORIZED_USER_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=AUTHORIZED_USER_ID,
+                    text=f"✅ <b>تم ربط قناة الأرشيف بنجاح!</b>\n\n📌 اسم القناة: <b>{chat.title}</b>\n🆔 المعرّف: <code>{chat.id}</code>\n\nالآن كل وسائط جديدة سيتم إرسال نسخة منها تلقائياً لقناتك مع منع التكرار! 📁",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify user about channel link: {e}")
 
 
 async def cancel_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1384,6 +1547,18 @@ async def cancel_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg_id = query.message.message_id
         cancelled_downloads.add(msg_id)
         await query.edit_message_text("تم إلغاء هذا التحميل.")
+    elif query.data.startswith("force_dl_"):
+        post_id = query.data.replace("force_dl_", "")
+        archived = is_post_archived(post_id)
+        if archived and archived.get("source_url"):
+            url = archived["source_url"]
+            await query.edit_message_text(f"⏳ جاري إعادة التحميل والإرسال بناءً على طلبك: {url}...")
+            # Trigger download bypassing de-duplication check
+            context.application.create_task(
+                handle_url(update, context, force_url=url)
+            )
+        else:
+            await query.edit_message_text("تعذر العثور على رابط المنشور لإعادة تحميله.")
 
 
 async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1447,29 +1622,186 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Failed to upload cookies: {e}")
 
 
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+async def send_media_to_target(
+    bot,
+    target_chat_id: int | str,
+    items: list[tuple[str, str]],
+    caption: str,
+    video_meta_cache: dict,
+    thumb_cache: dict,
+    loop
+) -> tuple[int, bool]:
+    """Sends a list of (path, kind) items to target_chat_id (user or channel).
+    Returns (successful_sends_count, sent_as_group)."""
+    if not items:
+        return 0, False
+
+    successful_sends = 0
+    sent_group = False
+
+    # Attempt album grouping if > 1 items
+    if len(items) > 1:
+        chunk_size = 10
+        all_chunks_sent = True
+        for i in range(0, len(items), chunk_size):
+            chunk = items[i:i + chunk_size]
+            chunk_caption = caption if i == 0 else ""
+            if len(chunk) == 1:
+                path, kind = chunk[0]
+                try:
+                    if kind == "photo":
+                        await _send_photo_isolated(target_chat_id, path, chunk_caption, timeout=120)
+                    else:
+                        meta = video_meta_cache.get(path)
+                        thumb = thumb_cache.get(path)
+                        await _send_video_isolated(target_chat_id, path, chunk_caption, meta=meta, thumb_path=thumb, timeout=300)
+                    successful_sends += 1
+                except Exception as e:
+                    logger.warning(f"Single item send failed to {target_chat_id}: {e}")
+                    all_chunks_sent = False
+            else:
+                try:
+                    group_ok = await send_media_group_isolated(
+                        bot, target_chat_id, chunk, chunk_caption,
+                        thumb_map=thumb_cache, meta_map=video_meta_cache
+                    )
+                    if group_ok:
+                        successful_sends += len(chunk)
+                    else:
+                        all_chunks_sent = False
+                        break
+                except Exception as e:
+                    logger.warning(f"Media group send failed to {target_chat_id}: {e}")
+                    all_chunks_sent = False
+                    break
+        if all_chunks_sent and successful_sends > 0:
+            sent_group = True
+
+    # Fallback: send one by one if not sent as group
+    if not sent_group:
+        for idx, (path, kind) in enumerate(items):
+            if not os.path.exists(path):
+                continue
+            item_caption = caption if idx == 0 else ""
+            for attempt in range(2):
+                try:
+                    if kind == "photo":
+                        await _send_photo_isolated(target_chat_id, path, item_caption, timeout=120)
+                    else:
+                        if path not in video_meta_cache:
+                            video_meta_cache[path] = await loop.run_in_executor(None, get_video_metadata, str(path))
+                        meta = video_meta_cache[path]
+                        if path not in thumb_cache:
+                            thumb_cache[path] = await loop.run_in_executor(None, extract_thumbnail, str(path))
+                        await _send_video_isolated(target_chat_id, path, item_caption, meta=meta, thumb_path=thumb_cache.get(path), timeout=300)
+                    successful_sends += 1
+                    break
+                except Exception as e:
+                    logger.error(f"Send failed to {target_chat_id} for {path} (attempt {attempt+1}): {e}")
+                    if attempt == 0:
+                        await asyncio.sleep(2)
+
+    return successful_sends, sent_group
+
+
+async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_url: str = None):
+    user = update.effective_user
+    chat = update.effective_chat
+    user_id = user.id if user else 0
+    chat_id = chat.id if chat else 0
+
     if not is_authorized(user_id):
-        await update.message.reply_text("Bot is for personal use only.")
+        if update.message:
+            await update.message.reply_text("Bot is for personal use only.")
+        elif chat_id:
+            await context.bot.send_message(chat_id=chat_id, text="Bot is for personal use only.")
         return
 
-    text = update.message.text.strip()
-    if text.lower() in ("start", "/start"):
-        await start(update, context)
-        return
+    # Check for forwarded message from a channel to bind it automatically
+    if update.message:
+        fwd_chat = None
+        if hasattr(update.message, "forward_origin") and update.message.forward_origin:
+            origin = update.message.forward_origin
+            if getattr(origin, "type", None) == "channel" and hasattr(origin, "chat"):
+                fwd_chat = origin.chat
+        if not fwd_chat and getattr(update.message, "forward_from_chat", None):
+            fwd_chat = update.message.forward_from_chat
 
-    url = extract_url(text)
-    if not url:
-        await update.message.reply_text(
-            "Please send a valid link.\n\n"
-            "Supported:\n"
-            "- X/Twitter: https://x.com/user/status/123\n"
-            "- Instagram: https://instagram.com/p/ABC/\n"
-            "- Facebook: https://facebook.com/user/videos/123"
-        )
-        return
+        if fwd_chat and getattr(fwd_chat, "type", "") in ("channel", "supergroup"):
+            ch_id = fwd_chat.id
+            ch_title = getattr(fwd_chat, "title", "Archive Channel")
+            set_archive_channel(ch_id, ch_title)
+            await update.message.reply_text(
+                f"✅ <b>تم ربط قناة الأرشيف بنجاح!</b>\n\n"
+                f"📌 اسم القناة: <b>{ch_title}</b>\n"
+                f"🆔 المعرّف: <code>{ch_id}</code>\n\n"
+                f"من الآن فصاعداً:\n"
+                f"1. أي وسائط جديدة هتحملها، هيروح منها نسخة تلقائياً لقناتك 📁✨\n"
+                f"2. لو المنشور اتحمل قبل كدا، البوت هينبهك فوراً ومش هيكرره أبداً لمنع التكرار 🛡️",
+                parse_mode="HTML"
+            )
+            return
 
-    chat_id = update.effective_chat.id
+    # Check if user sent a Telegram invite link directly
+    if update.message and update.message.text:
+        raw_text = update.message.text.strip()
+        if re.search(r"t\.me/(?:\+|joinchat/)", raw_text):
+            await update.message.reply_text(
+                "ℹ️ <b>تنبيه بخصوص ربط القناة:</b>\n\n"
+                "بوتات التيليجرام لا تستطيع الدخول عبر روابط الدعوة (Invite Links) بنفسها.\n\n"
+                "<b>طريقة الربط في ثواني:</b>\n"
+                "1️⃣ افتح قناتك واضغط على إعدادات القناة (⚙️) ➡️ المشرفين (Administrators).\n"
+                "2️⃣ اضغط <b>إضافة مشرف (Add Admin)</b> وابحث عن البوت: <code>@mohamed_x_downloader_bot</code>\n"
+                "3️⃣ امنحه صلاحية <b>نشر الرسائل (Post Messages)</b> ثم احفظ.\n"
+                "4️⃣ بعد إضافته، <b>أعد توجيه (Forward) أي رسالة</b> من القناة إلى هنا، وسيتم الربط فوراً وتلقائياً! 🚀",
+                parse_mode="HTML"
+            )
+            return
+
+    if force_url:
+        url = force_url
+    else:
+        if not update.message or not update.message.text:
+            return
+        text = update.message.text.strip()
+        if text.lower() in ("start", "/start"):
+            await start(update, context)
+            return
+
+        url = extract_url(text)
+        if not url:
+            await update.message.reply_text(
+                "Please send a valid link.\n\n"
+                "Supported:\n"
+                "- X/Twitter: https://x.com/user/status/123\n"
+                "- Instagram: https://instagram.com/p/ABC/\n"
+                "- Facebook: https://facebook.com/user/videos/123\n"
+                "- TikTok: https://vm.tiktok.com/ABC/"
+            )
+            return
+
+    # Canonical de-duplication check
+    canonical_id, platform_name = get_canonical_post_id(url)
+    if not force_url:
+        archived_item = is_post_archived(canonical_id)
+        if archived_item:
+            arch_date = archived_item.get("created_at", "سابقاً")
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 تحميل وإرسال لي مجدداً", callback_data=f"force_dl_{canonical_id}")]
+            ])
+            text_warn = (
+                f"⚠️ <b>هذا المنشور تم تحميله وأرشفته بالفعل!</b>\n\n"
+                f"🌐 <b>المنصة:</b> {platform_name}\n"
+                f"🆔 <b>المعرّف:</b> <code>{canonical_id}</code>\n"
+                f"📅 <b>تاريخ الأرشفة:</b> {arch_date}\n\n"
+                f"🛡️ <i>تم منع تكرار الإرسال إلى القناة للحفاظ على نظافة الأرشيف.</i>\n"
+                f"إذا كنت تريد إرسال نسخة لك هنا في المحادثة، اضغط على الزر بالأسفل:"
+            )
+            if update.message:
+                await update.message.reply_text(text_warn, parse_mode="HTML", reply_markup=kb)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=text_warn, parse_mode="HTML", reply_markup=kb)
+            return
 
     queued = False
     async with _queue_lock:
@@ -1483,7 +1815,10 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             position = 1
             status_text = "⏳ جاري التحميل..."
 
-    status_msg = await update.message.reply_text(status_text, reply_markup=cancel_keyboard)
+    if update.message:
+        status_msg = await update.message.reply_text(status_text, reply_markup=cancel_keyboard)
+    else:
+        status_msg = await context.bot.send_message(chat_id=chat_id, text=status_text, reply_markup=cancel_keyboard)
     status_id = status_msg.message_id
 
     req_dir = DOWNLOAD_DIR / f"req_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
@@ -1511,11 +1846,13 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return False
 
     async def notify_stopped(reason: str):
-        """Notify user clearly via status edit AND an explicit new reply that the download has stopped."""
         full_msg = f"🛑 توقف التحميل:\n{reason}"
         await safe_edit(status_msg, full_msg)
         try:
-            await update.message.reply_text(full_msg)
+            if update.message:
+                await update.message.reply_text(full_msg)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=full_msg)
         except Exception as e:
             logger.error(f"Failed to send stop notification reply: {e}")
 
@@ -1572,7 +1909,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             caption = (info or {}).get("description", "") or (info or {}).get("title", "") or ""
-            await safe_edit(status_msg, f"⬆️ رفع {len(file_paths)} ملف...")
+            await safe_edit(status_msg, f"⬆️ تجهيز {len(file_paths)} ملف للرفع...")
 
             photos = [fp for fp in file_paths if fp.lower().endswith(IMAGE_EXTS)]
             videos = [fp for fp in file_paths if fp.lower().endswith(VIDEO_EXTS)]
@@ -1618,122 +1955,60 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await loop.run_in_executor(None, ensure_faststart, video_path)
                     prepared_items.append((video_path, "video"))
 
+            seen_paths = set()
+            unique_items = []
+            for p, k in prepared_items:
+                if p not in seen_paths and os.path.exists(p):
+                    seen_paths.add(p)
+                    unique_items.append((p, k))
+
+            if not unique_items:
+                await notify_stopped("لم يتم العثور على أي ملفات صالحة للإرسال.")
+                return
+
             video_meta_cache = {}
             thumb_cache = {}
-            successful_sends = 0
-            last_upload_error = ""
+            for p, k in unique_items:
+                if k == "video":
+                    if p not in video_meta_cache:
+                        video_meta_cache[p] = await loop.run_in_executor(None, get_video_metadata, str(p))
+                    if p not in thumb_cache:
+                        thumb_cache[p] = await loop.run_in_executor(None, extract_thumbnail, str(p))
 
-            photo_items = [(path, kind) for path, kind in prepared_items if kind == "photo"]
-            video_items = [(path, kind) for path, kind in prepared_items if kind == "video"]
-
-            # Try to send as media group first if multiple items (photos, videos, or mixed)
-            sent_group = False
-            if len(prepared_items) > 1:
-                seen_paths = set()
-                unique_items = []
-                for path, kind in prepared_items:
-                    if path not in seen_paths and os.path.exists(path):
-                        seen_paths.add(path)
-                        unique_items.append((path, kind))
-
-                if len(unique_items) > 1:
-                    # Pre-extract video metadata and thumbnails for album items
-                    for path, kind in unique_items:
-                        if kind == "video":
-                            if path not in video_meta_cache:
-                                video_meta_cache[path] = await loop.run_in_executor(None, get_video_metadata, str(path))
-                            if path not in thumb_cache:
-                                thumb_cache[path] = await loop.run_in_executor(None, extract_thumbnail, str(path))
-
-                    chunk_size = 10
-                    all_chunks_sent = True
-                    for i in range(0, len(unique_items), chunk_size):
-                        chunk = unique_items[i:i + chunk_size]
-                        if len(chunk) == 1:
-                            path, kind = chunk[0]
-                            try:
-                                if kind == "photo":
-                                    await _send_photo_isolated(chat_id, path, caption if i == 0 else "", timeout=120)
-                                else:
-                                    meta = video_meta_cache.get(path)
-                                    thumb = thumb_cache.get(path)
-                                    await _send_video_isolated(chat_id, path, caption if i == 0 else "", meta=meta, thumb_path=thumb, timeout=300)
-                                successful_sends += 1
-                                _cleanup_file(path)
-                            except Exception as e:
-                                logger.warning(f"Single item send failed: {e}")
-                                last_upload_error = str(e)
-                                all_chunks_sent = False
-                        else:
-                            try:
-                                group_ok = await send_media_group_isolated(
-                                    context.bot, chat_id, chunk, caption if i == 0 else "",
-                                    thumb_map=thumb_cache, meta_map=video_meta_cache
-                                )
-                                if group_ok:
-                                    successful_sends += len(chunk)
-                                    for path, _ in chunk:
-                                        _cleanup_file(path)
-                                else:
-                                    all_chunks_sent = False
-                                    break
-                            except Exception as e:
-                                logger.warning(f"Media group send failed: {e}")
-                                last_upload_error = str(e)
-                                all_chunks_sent = False
-                                break
-                    if all_chunks_sent and successful_sends > 0:
-                        sent_group = True
-
-            if not sent_group:
-                for idx, (path, kind) in enumerate(prepared_items):
-                    if not os.path.exists(path):
-                        continue
-                    if status_id in cancelled_downloads:
-                        await notify_stopped("تم إلغاء التحميل.")
-                        break
-
-                    file_mb = os.path.getsize(path) / (1024 * 1024) if os.path.exists(path) else 0
-                    upload_timeout = 300 if kind == "video" else 120
-
-                    for attempt in range(2):
-                        try:
-                            await safe_edit(status_msg, f"⬆️ رفع {idx+1}/{len(prepared_items)} — {os.path.basename(path)} ({file_mb:.1f}MB)")
-                            if kind == "photo":
-                                await _send_photo_isolated(chat_id, path, caption, timeout=120)
-                            else:
-                                if path not in video_meta_cache:
-                                    video_meta_cache[path] = await loop.run_in_executor(None, get_video_metadata, str(path))
-                                meta = video_meta_cache[path]
-                                if path not in thumb_cache:
-                                    thumb_cache[path] = await loop.run_in_executor(None, extract_thumbnail, str(path))
-                                await _send_video_isolated(chat_id, path, caption, meta=meta, thumb_path=thumb_cache.get(path), timeout=upload_timeout)
-                            logger.info(f"Sent {kind}: {os.path.basename(path)} ({file_mb:.1f}MB)")
-                            successful_sends += 1
-                            break
-                        except asyncio.TimeoutError:
-                            last_upload_error = f"انتهت مهلة إرسال الملف ({file_mb:.1f}MB)"
-                            logger.error(f"Send timed out for {path} (attempt {attempt+1})")
-                            if attempt == 0:
-                                await safe_edit(status_msg, f"⚠️ رفع {os.path.basename(path)} علق — بجرب تاني...")
-                                await asyncio.sleep(2)
-                        except Exception as e:
-                            last_upload_error = str(e)
-                            logger.error(f"Send failed for {path} (attempt {attempt+1}): {e}")
-                            if attempt == 0:
-                                await safe_edit(status_msg, f"⚠️ فشل {os.path.basename(path)} — بجرب تاني...")
-                                await asyncio.sleep(2)
-                    _cleanup_file(path)
+            await safe_edit(status_msg, f"⬆️ جاري إرسال {len(unique_items)} ملف...")
+            successful_sends, sent_group = await send_media_to_target(
+                context.bot, chat_id, unique_items, caption,
+                video_meta_cache, thumb_cache, loop
+            )
 
             if successful_sends > 0:
                 try:
                     await status_msg.delete()
                 except Exception:
                     pass
-                if successful_sends < len(prepared_items):
-                    await update.message.reply_text(f"⚠️ تم إرسال {successful_sends} من أصل {len(prepared_items)} ملفات (تعذر إرسال الباقي).")
+                if successful_sends < len(unique_items):
+                    if update.message:
+                        await update.message.reply_text(f"⚠️ تم إرسال {successful_sends} من أصل {len(unique_items)} ملفات (تعذر إرسال الباقي).")
+
+                # If this was not a forced re-download, save to archive and forward to channel!
+                if not force_url:
+                    save_archive_item(canonical_id, platform_name, url, caption=caption)
+                    arch_ch = get_archive_channel()
+                    if arch_ch:
+                        ch_caption = f"🔗 {url}\n\n"
+                        if caption:
+                            ch_caption += f"{caption[:350]}\n\n"
+                        ch_caption += f"#{platform_name.replace(' ', '_')}"
+                        try:
+                            ch_sends, _ = await send_media_to_target(
+                                context.bot, arch_ch, unique_items, ch_caption,
+                                video_meta_cache, thumb_cache, loop
+                            )
+                            logger.info(f"Archived {ch_sends} media item(s) to channel {arch_ch}")
+                        except Exception as ce:
+                            logger.error(f"Failed to forward to archive channel {arch_ch}: {ce}")
             else:
-                await notify_stopped(f"تعذر إرسال الملفات إلى تيليجرام:\n{last_upload_error[:150] if last_upload_error else 'حدث خطأ أثناء الإرسال'}")
+                await notify_stopped("تعذر إرسال الملفات إلى تيليجرام.")
 
     except asyncio.TimeoutError:
         logger.error(f"Timeout processing {url}")
@@ -1756,6 +2031,8 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN not set in .env file")
+
+    init_db()
 
     builder = Application.builder().token(BOT_TOKEN)
 
@@ -1792,8 +2069,12 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", start))
     application.add_handler(CommandHandler("cookies", cookies_command))
+    application.add_handler(CommandHandler("channel", archive_command))
+    application.add_handler(CommandHandler("archive", archive_command))
+    application.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_handler(CallbackQueryHandler(cancel_button))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.FORWARDED, handle_url))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
 
     start_health_check_server()
