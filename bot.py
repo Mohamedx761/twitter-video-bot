@@ -38,6 +38,8 @@ BOT_VERSION = "v2.4-channel-archive-anti-duplicate"
 
 DB_PATH = Path("archive.db")
 
+DEFAULT_ARCHIVE_CHANNEL_ID = -1004482083833
+
 def init_db():
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -58,8 +60,14 @@ def init_db():
                     value TEXT
                 )
             """)
+            conn.execute("""
+                INSERT OR IGNORE INTO settings (key, value) VALUES ('archive_channel_id', '-1004482083833')
+            """)
+            conn.execute("""
+                INSERT OR IGNORE INTO settings (key, value) VALUES ('archive_channel_title', 'SD')
+            """)
             conn.commit()
-            logger.info("Archive database initialized successfully")
+            logger.info("Archive database initialized successfully with default channel SD (-1004482083833)")
     except Exception as e:
         logger.error(f"init_db failed: {e}")
 
@@ -123,7 +131,7 @@ def get_archive_channel():
                     return row[0]
     except Exception as e:
         logger.error(f"get_archive_channel error: {e}")
-    return None
+    return DEFAULT_ARCHIVE_CHANNEL_ID
 
 def set_archive_channel(channel_id, channel_title=""):
     try:
@@ -1490,7 +1498,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def archive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
+    chat = update.effective_chat
+    if chat and chat.type in ("channel", "supergroup"):
+        set_archive_channel(chat.id, chat.title or "Archive Channel")
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=f"✅ <b>تم ضبط هذه القناة كقناة للأرشيف بنجاح!</b>\n📌 <b>{chat.title}</b> (<code>{chat.id}</code>)",
+            parse_mode="HTML"
+        )
+        return
+
+    if not update.effective_user or not is_authorized(update.effective_user.id):
         return
     current_ch = get_archive_channel()
     if context.args:
@@ -1519,6 +1537,14 @@ async def archive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "أو اكتب: <code>/channel -100xxxxxxxxxx</code> مع وضع ID القناة.",
             parse_mode="HTML"
         )
+
+
+async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.channel_post and update.channel_post.chat:
+        chat = update.channel_post.chat
+        if chat.type in ("channel", "supergroup"):
+            set_archive_channel(chat.id, chat.title or "Archive Channel")
+            logger.info(f"Auto-bound archive channel via channel_post: {chat.title} ({chat.id})")
 
 
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2071,7 +2097,9 @@ def main():
     application.add_handler(CommandHandler("cookies", cookies_command))
     application.add_handler(CommandHandler("channel", archive_command))
     application.add_handler(CommandHandler("archive", archive_command))
+    application.add_handler(CommandHandler("set_archive", archive_command))
     application.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    application.add_handler(MessageHandler(filters.ChatType.CHANNEL, on_channel_post))
     application.add_handler(CallbackQueryHandler(cancel_button))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.FORWARDED, handle_url))
