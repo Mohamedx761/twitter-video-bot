@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 import shutil
+import math
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from dotenv import load_dotenv
@@ -615,14 +616,19 @@ def _download_direct_url(url: str, dest: Path, timeout: int = 300, progress_cb=N
 
 def download_image_ytdlp(image_url: str, download_path: Path, idx: int, progress_cb=None) -> str:
     is_video = ".mp4" in image_url or "video.twimg.com" in image_url
-    ext = "mp4" if is_video else "%(ext)s"
+    ext = "mp4" if is_video else "jpg"
+    if ".png" in image_url.lower():
+        ext = "png"
+    elif ".webp" in image_url.lower():
+        ext = "webp"
     fpath = download_path / f"{idx:05d}.{ext}"
 
-    if is_video and "video.twimg.com" in image_url:
-        logger.info(f"Trying direct CDN download for: {image_url[:80]}")
+    # If it is a direct image URL (including pbs.twimg.com) or Twitter CDN video, download directly via HTTP!
+    if "twimg.com" in image_url or re.search(r"\.(jpg|jpeg|png|webp|mp4)(\?|$)", image_url, re.I):
+        logger.info(f"Direct downloading media ({'video' if is_video else 'photo'}): {image_url[:80]}")
         if _download_direct_url(image_url, fpath, progress_cb=progress_cb):
             return str(fpath)
-        logger.warning("Direct CDN download failed, falling back to yt-dlp")
+        logger.warning("Direct download failed, falling back to yt-dlp")
 
     # Determine platform for proper headers
     is_tiktok = "tiktok.com" in image_url or "tiktokcdn.com" in image_url
@@ -639,7 +645,6 @@ def download_image_ytdlp(image_url: str, download_path: Path, idx: int, progress
         "--legacy-server-connect",
     ]
     if is_tiktok or is_instagram:
-        # Add proper headers for TikTok/Instagram
         cmd += [
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "--referer", "https://www.tiktok.com/" if is_tiktok else "https://www.instagram.com/",
@@ -647,15 +652,12 @@ def download_image_ytdlp(image_url: str, download_path: Path, idx: int, progress
     cmd += get_cookie_args() + ["-o", str(fpath), image_url]
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if proc.returncode != 0 and proc.stderr.strip():
             logger.error(f"Download stderr: {proc.stderr.strip()[:500]}")
     except Exception as e:
         logger.error(f"Download exception: {e}")
-    for f in download_path.iterdir():
-        if f.name.startswith(f"{idx:05d}.") and f.is_file() and not f.name.endswith(".info.json") and f.stat().st_size > 0:
-            return str(f)
-    return None
+
     for f in download_path.iterdir():
         if f.name.startswith(f"{idx:05d}.") and f.is_file() and not f.name.endswith(".info.json") and f.stat().st_size > 0:
             return str(f)
@@ -914,68 +916,142 @@ def get_tiktok_image_urls(url: str) -> list:
     return []
 
 
-def get_x_image_urls(url: str) -> list:
-    """Use Twitter syndication API to get media URLs (images + videos) from X/Twitter posts."""
+def get_x_syndication_token(tweet_id: str) -> str:
+    """Calculate the mathematical token required for cdn.syndication.twimg.com."""
+    try:
+        val = (float(tweet_id) / 1e15) * math.pi
+        digits = '0123456789abcdefghijklmnopqrstuvwxyz'
+        def to_b36(n):
+            res = []
+            n = int(n)
+            while n > 0:
+                n, r = divmod(n, 36)
+                res.append(digits[r])
+            return ''.join(reversed(res)) or '0'
+        int_p = int(val)
+        frac_p = val - int_p
+        frac_s = []
+        c = frac_p
+        for _ in range(12):
+            c *= 36
+            d = int(c)
+            frac_s.append(to_b36(d))
+            c -= d
+        s = to_b36(int_p) + ''.join(frac_s)
+        return re.sub(r'(0+|\.)', '', s)
+    except Exception:
+        return 'x'
+
+
+def get_x_media(url: str) -> tuple[dict, list]:
+    """Fetch photos and video URLs directly from X/Twitter via FxTwitter v2 and Syndication API.
+    Guarantees full support for image galleries and direct video downloads without yt-dlp blocks."""
     tweet_id_match = re.search(r"/status/(\d+)", url)
     if not tweet_id_match:
-        logger.error(f"X image fetch: cannot extract tweet ID from {url}")
-        return []
+        return {}, []
     tweet_id = tweet_id_match.group(1)
 
-    syndication_url = f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&token=x"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA",
-    }
+    info = {}
+    media_urls = []
 
+    # Source 1: FxTwitter API v2
+    fxtwitter_endpoints = [
+        f"https://api.fxtwitter.com/2/status/{tweet_id}",
+    ]
+    handle_match = re.search(r"(?:x\.com|twitter\.com)/([^/]+)/status/\d+", url)
+    if handle_match and handle_match.group(1) not in ("i", "status"):
+        handle = handle_match.group(1)
+        fxtwitter_endpoints.append(f"https://api.fxtwitter.com/{handle}/status/{tweet_id}")
+
+    for api_url in fxtwitter_endpoints:
+        try:
+            req = urllib.request.Request(
+                api_url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode())
+                st = data.get("status") or data.get("tweet") or {}
+                if st:
+                    if not info:
+                        info = {"description": st.get("text", ""), "title": st.get("text", "")}
+                    media = st.get("media", {})
+                    # Photos
+                    for p in media.get("photos", []):
+                        u = p.get("url")
+                        if u and u not in media_urls:
+                            if "pbs.twimg.com/media/" in u and "name=" not in u:
+                                u = f"{u}?name=orig"
+                            media_urls.append(u)
+                    # Videos
+                    for v in media.get("videos", []):
+                        u = v.get("url")
+                        if u and u not in media_urls:
+                            media_urls.append(u)
+                    # All (fallback)
+                    for a in media.get("all", []):
+                        u = a.get("url")
+                        if u and u not in media_urls:
+                            if "pbs.twimg.com/media/" in u and "name=" not in u:
+                                u = f"{u}?name=orig"
+                            media_urls.append(u)
+                    if media_urls:
+                        logger.info(f"FxTwitter API found {len(media_urls)} media URL(s) for tweet {tweet_id}")
+                        return info, media_urls
+        except Exception as e:
+            logger.info(f"FxTwitter attempt failed ({api_url}): {e}")
+
+    # Source 2: Twitter Syndication API
+    token = get_x_syndication_token(tweet_id)
+    syndication_url = f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&token={token}&lang=en"
     try:
-        logger.info(f"X syndication API for tweet {tweet_id}")
-        req = urllib.request.Request(syndication_url, headers=headers)
-        resp = urllib.request.urlopen(req, timeout=15)
-        data = json.loads(resp.read())
+        req = urllib.request.Request(
+            syndication_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://platform.twitter.com/",
+            }
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            if not info and data.get("text"):
+                info = {"description": data.get("text", ""), "title": data.get("text", "")}
 
-        urls = []
+            media_lists = [data.get("mediaDetails", [])]
+            if not media_lists[0]:
+                media_lists = [data.get("extended_entities", {}).get("media", [])]
 
-        media_lists = [data.get("mediaDetails", [])]
-        if not media_lists[0]:
-            media_lists = [data.get("extended_entities", {}).get("media", [])]
-        if not media_lists[0]:
-            media_lists = [data.get("extended_entities", {}).get("mediaDetails", [])]
-
-        for media_list in media_lists:
-            for media in media_list:
-                media_type = media.get("type", "")
-                if media_type == "photo":
-                    media_url = media.get("media_url_https", "")
-                    if media_url:
-                        urls.append(media_url)
-                elif media_type in ("video", "animated_gif"):
-                    variants = media.get("video_info", {}).get("variants", [])
-                    best = None
-                    for v in variants:
-                        if v.get("content_type") == "video/mp4" and v.get("url"):
-                            if best is None or v.get("bitrate", 0) > best.get("bitrate", 0):
-                                best = v
-                    if best:
-                        urls.append(best["url"])
-                    else:
+            for media_list in media_lists:
+                for media in media_list:
+                    media_type = media.get("type", "")
+                    if media_type == "photo":
+                        media_url = media.get("media_url_https", "")
+                        if media_url:
+                            if "name=" not in media_url:
+                                media_url = f"{media_url}?name=orig"
+                            if media_url not in media_urls:
+                                media_urls.append(media_url)
+                    elif media_type in ("video", "animated_gif"):
+                        variants = media.get("video_info", {}).get("variants", [])
+                        best = None
                         for v in variants:
-                            if v.get("url"):
-                                urls.append(v["url"])
-                                break
-
-        if not urls:
-            for key in ["video_url", "video_url_https"]:
-                val = data.get(key)
-                if isinstance(val, str) and val.startswith("http"):
-                    urls.append(val)
-
-        urls = list(dict.fromkeys(urls))
-        logger.info(f"X syndication API: {len(urls)} URL(s)")
-        return urls
+                            if v.get("content_type") == "video/mp4" and v.get("url"):
+                                if best is None or v.get("bitrate", 0) > best.get("bitrate", 0):
+                                    best = v
+                        if best and best["url"] not in media_urls:
+                            media_urls.append(best["url"])
+                        else:
+                            for v in variants:
+                                if v.get("url") and v["url"] not in media_urls:
+                                    media_urls.append(v["url"])
+                                    break
+        if media_urls:
+            logger.info(f"Syndication API found {len(media_urls)} media URL(s) for tweet {tweet_id}")
+            return info, media_urls
     except Exception as e:
-        logger.error(f"X syndication API failed: {e}")
-    return []
+        logger.warning(f"Syndication API failed for tweet {tweet_id}: {e}")
+
+    return info, media_urls
 
 
 def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: int, app: Application, progress: dict = None) -> tuple[dict, list]:
@@ -1004,30 +1080,55 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
     info = {}
     last_stderr = ""
 
-    if have_cookies_file:
-        logger.info(f"Attempting download with cookies (is_x={is_x})...")
-        try:
-            last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=True, progress=progress, timeout=60)
-        except Exception as e:
-            logger.warning(f"Download with cookies failed: {e}")
-            last_stderr = str(e)
+    # For X (Twitter), first try direct API extraction for photos and videos
+    if is_x:
+        x_info, x_urls = get_x_media(url)
+        if x_urls:
+            logger.info(f"X/Twitter direct extraction: {len(x_urls)} media item(s) found")
+            if not info and x_info:
+                info = x_info
+            for u in x_urls:
+                if u not in all_image_urls:
+                    all_image_urls.append(u)
 
-        # Check if any media was downloaded
-        after_files = set(f.name for f in download_path.iterdir() if f.is_file() and not f.name.endswith(".info.json"))
-        if not (after_files - before_files):
-            logger.info("No media found using cookies. Retrying WITHOUT cookies as fallback...")
+    # If not X, or if direct X extraction found nothing, run yt-dlp
+    if not all_image_urls:
+        if have_cookies_file:
+            logger.info(f"Attempting download with cookies (is_x={is_x})...")
+            try:
+                last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=True, progress=progress, timeout=60)
+            except Exception as e:
+                logger.warning(f"Download with cookies failed: {e}")
+                last_stderr = str(e)
+
+            # Check if any media was downloaded
+            after_files = set(f.name for f in download_path.iterdir() if f.is_file() and not f.name.endswith(".info.json"))
+            if not (after_files - before_files):
+                logger.info("No media found using cookies. Retrying WITHOUT cookies as fallback...")
+                try:
+                    last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=False, progress=progress, timeout=60)
+                except Exception as e:
+                    logger.warning(f"Fallback download without cookies failed: {e}")
+                    last_stderr = str(e)
+        else:
+            logger.info(f"Attempting download without cookies (is_x={is_x})...")
             try:
                 last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=False, progress=progress, timeout=60)
             except Exception as e:
-                logger.warning(f"Fallback download without cookies failed: {e}")
+                logger.warning(f"Download without cookies failed: {e}")
                 last_stderr = str(e)
-    else:
-        logger.info(f"Attempting download without cookies (is_x={is_x})...")
-        try:
-            last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=False, progress=progress, timeout=60)
-        except Exception as e:
-            logger.warning(f"Download without cookies failed: {e}")
-            last_stderr = str(e)
+
+        # If yt-dlp finished and is_x still has no media, try get_x_media as fallback
+        if is_x:
+            after_files = set(f.name for f in download_path.iterdir() if f.is_file() and not f.name.endswith(".info.json"))
+            if not (after_files - before_files) and not all_image_urls:
+                x_info, x_urls = get_x_media(url)
+                if x_urls:
+                    if not info and x_info:
+                        info = x_info
+                    for u in x_urls:
+                        if u not in all_image_urls:
+                            all_image_urls.append(u)
 
     for f in sorted(download_path.glob("*.info.json")):
         try:
