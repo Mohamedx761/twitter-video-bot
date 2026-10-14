@@ -7,6 +7,9 @@ import json
 import hashlib
 import urllib.request
 import threading
+import time
+import uuid
+import shutil
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from dotenv import load_dotenv
@@ -192,10 +195,10 @@ def start_health_check_server():
     except Exception as e:
         logger.warning(f"Could not start health check HTTP server on port {port}: {e}")
 
-cancelled_downloads = {}
+cancelled_downloads = set()
 _download_semaphore = asyncio.Semaphore(1)
-_queue_counter = {"value": 0}
 _queue_lock = asyncio.Lock()
+_waiting_count = 0
 
 
 def is_authorized(user_id: int) -> bool:
@@ -782,6 +785,8 @@ def run_ytdlp_download(url: str, download_path: Path, is_carousel: bool, is_x: b
         "--write-info-json",
         "--no-overwrites",
         "--concurrent-fragments", "2",
+        "--socket-timeout", "20",
+        "--retries", "3",
     ]
     if use_cookies:
         cmd_dl += get_cookie_args()
@@ -796,13 +801,13 @@ def run_ytdlp_download(url: str, download_path: Path, is_carousel: bool, is_x: b
     cmd_dl.append(url)
 
     try:
-        proc = subprocess.run(cmd_dl, capture_output=True, text=True, timeout=300)
+        proc = subprocess.run(cmd_dl, capture_output=True, text=True, timeout=180)
         stderr = proc.stderr or ""
         if stderr.strip():
             logger.error(f"yt-dlp stderr (cookies={use_cookies}): {stderr.strip()[:1000]}")
         return stderr
     except subprocess.TimeoutExpired:
-        raise ValueError("التحميل أخد وقت طويل اوى (5 دقايق). جرب تاني أو تأكد إن اللنك شغال.")
+        raise ValueError("التحميل أخد وقت طويل (أكثر من 3 دقائق). جرب تاني أو تأكد إن اللنك شغال.")
     except FileNotFoundError:
         raise ValueError("yt-dlp not found.")
 
@@ -1079,9 +1084,9 @@ async def cancel_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "cancel_download":
-        chat_id = query.message.chat.id
-        cancelled_downloads[chat_id] = True
-        await query.edit_message_text("Download cancelled.")
+        msg_id = query.message.message_id
+        cancelled_downloads.add(msg_id)
+        await query.edit_message_text("تم إلغاء هذا التحميل.")
 
 
 async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1168,18 +1173,24 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
-    cancelled_downloads[chat_id] = False
 
+    queued = False
     async with _queue_lock:
-        _queue_counter["value"] += 1
-        position = _queue_counter["value"]
-
-    if position == 1:
-        status_text = "⏳ جاري التحميل..."
-    else:
-        status_text = f"⏳ في دور #{position} — في انتظار التحميل..."
+        global _waiting_count
+        if _download_semaphore.locked():
+            _waiting_count += 1
+            queued = True
+            position = _waiting_count + 1
+            status_text = f"⏳ في دور #{position} — في انتظار انتهاء التحميل السابق..."
+        else:
+            position = 1
+            status_text = "⏳ جاري التحميل..."
 
     status_msg = await update.message.reply_text(status_text, reply_markup=cancel_keyboard)
+    status_id = status_msg.message_id
+
+    req_dir = DOWNLOAD_DIR / f"req_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
+    req_dir.mkdir(parents=True, exist_ok=True)
 
     loop = asyncio.get_running_loop()
     _edit_lock = asyncio.Lock()
@@ -1195,11 +1206,15 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         async with _download_semaphore:
-            async with _queue_lock:
-                _queue_counter["value"] = max(0, _queue_counter["value"] - 1)
-
-            if position > 1:
+            if queued:
+                async with _queue_lock:
+                    _waiting_count = max(0, _waiting_count - 1)
+                queued = False
                 await safe_edit(status_msg, "⏳ جاري التحميل...")
+
+            if status_id in cancelled_downloads:
+                await safe_edit(status_msg, "تم الإلغاء.")
+                return
 
             progress = {"msg": ""}
 
@@ -1216,7 +1231,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 info, file_paths = await asyncio.wait_for(
                     loop.run_in_executor(
-                        None, extract_media, url, DOWNLOAD_DIR, chat_id, status_msg.message_id, context.application, progress
+                        None, extract_media, url, req_dir, chat_id, status_id, context.application, progress
                     ),
                     timeout=300,
                 )
@@ -1230,7 +1245,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except asyncio.CancelledError:
                     pass
 
-            if cancelled_downloads.get(chat_id):
+            if status_id in cancelled_downloads:
                 await safe_edit(status_msg, "تم الإلغاء.")
                 return
 
@@ -1238,159 +1253,154 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await safe_edit(status_msg, "❌ مفيش ميديا في البوست ده.")
                 return
 
-        caption = (info or {}).get("description", "") or (info or {}).get("title", "") or ""
-        await safe_edit(status_msg, f"⬆️ رفع {len(file_paths)} ملف...")
+            caption = (info or {}).get("description", "") or (info or {}).get("title", "") or ""
+            await safe_edit(status_msg, f"⬆️ رفع {len(file_paths)} ملف...")
 
-        photos = [fp for fp in file_paths if fp.lower().endswith(IMAGE_EXTS)]
-        videos = [fp for fp in file_paths if fp.lower().endswith(VIDEO_EXTS)]
-        prepared_items = []
-        use_local = os.getenv("USE_LOCAL_SERVER", "false").lower() == "true"
+            photos = [fp for fp in file_paths if fp.lower().endswith(IMAGE_EXTS)]
+            videos = [fp for fp in file_paths if fp.lower().endswith(VIDEO_EXTS)]
+            prepared_items = []
+            use_local = os.getenv("USE_LOCAL_SERVER", "false").lower() == "true"
 
-        for photo_path in photos:
-            if not os.path.exists(photo_path):
-                continue
-            fp_size = os.path.getsize(photo_path) / (1024 * 1024)
-            use_path = photo_path
-            if not use_local and fp_size > 10:
-                cpath = str(photo_path) + ".compressed.jpg"
-                try:
-                    await loop.run_in_executor(None, lambda p=str(photo_path), c=str(cpath): subprocess.run([
-                        "ffmpeg", "-i", p, "-vf", "scale=min(1280,iw):-2",
-                        "-q:v", "2", c, "-y"
-                    ]))
-                    if os.path.exists(cpath) and os.path.getsize(cpath) < 10 * 1024 * 1024:
-                        use_path = cpath
-                except FileNotFoundError:
-                    pass
-            prepared_items.append((use_path, "photo"))
+            for photo_path in photos:
+                if not os.path.exists(photo_path):
+                    continue
+                fp_size = os.path.getsize(photo_path) / (1024 * 1024)
+                use_path = photo_path
+                if not use_local and fp_size > 10:
+                    cpath = str(photo_path) + ".compressed.jpg"
+                    try:
+                        await loop.run_in_executor(None, lambda p=str(photo_path), c=str(cpath): subprocess.run([
+                            "ffmpeg", "-i", p, "-vf", "scale=min(1280,iw):-2",
+                            "-q:v", "2", c, "-y"
+                        ]))
+                        if os.path.exists(cpath) and os.path.getsize(cpath) < 10 * 1024 * 1024:
+                            use_path = cpath
+                    except FileNotFoundError:
+                        pass
+                prepared_items.append((use_path, "photo"))
 
-        upload_limit_mb = 2000 if use_local else 50
-        for video_path in videos:
-            if not os.path.exists(video_path):
-                continue
-            file_mb = os.path.getsize(video_path) / (1024 * 1024)
-            if file_mb > upload_limit_mb:
-                if use_local:
-                    await safe_edit(status_msg, f"❌ الفيديو {file_mb:.0f}MB — كبير جداً للـ Local Server.")
-                    return
-                cpath = str(video_path) + ".compressed.mp4"
-                try:
-                    compressed = await loop.run_in_executor(None, compress_video, video_path, cpath, 49.0)
-                    prepared_items.append((cpath if compressed and os.path.exists(cpath) else video_path, "video"))
-                except ValueError as ve:
-                    await safe_edit(status_msg, f"❌ {ve}")
-                    return
-            elif not use_local and file_mb > 50:
-                cpath = str(video_path) + ".compressed.mp4"
-                try:
-                    compressed = await loop.run_in_executor(None, compress_video, video_path, cpath, 49.0)
-                    prepared_items.append((cpath if compressed and os.path.exists(cpath) else video_path, "video"))
-                except ValueError as ve:
-                    await safe_edit(status_msg, f"❌ {ve}")
-                    return
-            else:
-                if use_local:
-                    await loop.run_in_executor(None, ensure_faststart, video_path)
-                prepared_items.append((video_path, "video"))
+            upload_limit_mb = 2000 if use_local else 50
+            for video_path in videos:
+                if not os.path.exists(video_path):
+                    continue
+                file_mb = os.path.getsize(video_path) / (1024 * 1024)
+                if file_mb > upload_limit_mb:
+                    if use_local:
+                        await safe_edit(status_msg, f"❌ الفيديو {file_mb:.0f}MB — كبير جداً للـ Local Server.")
+                        return
+                    cpath = str(video_path) + ".compressed.mp4"
+                    try:
+                        compressed = await loop.run_in_executor(None, compress_video, video_path, cpath, 49.0)
+                        prepared_items.append((cpath if compressed and os.path.exists(cpath) else video_path, "video"))
+                    except ValueError as ve:
+                        await safe_edit(status_msg, f"❌ {ve}")
+                        return
+                elif not use_local and file_mb > 50:
+                    cpath = str(video_path) + ".compressed.mp4"
+                    try:
+                        compressed = await loop.run_in_executor(None, compress_video, video_path, cpath, 49.0)
+                        prepared_items.append((cpath if compressed and os.path.exists(cpath) else video_path, "video"))
+                    except ValueError as ve:
+                        await safe_edit(status_msg, f"❌ {ve}")
+                        return
+                else:
+                    if use_local:
+                        await loop.run_in_executor(None, ensure_faststart, video_path)
+                    prepared_items.append((video_path, "video"))
 
-        video_meta_cache = {}
-        thumb_cache = {}
+            video_meta_cache = {}
+            thumb_cache = {}
 
-        # Prepare media lists for media group sending
-        photo_items = [(path, kind) for path, kind in prepared_items if kind == "photo"]
-        video_items = [(path, kind) for path, kind in prepared_items if kind == "video"]
+            # Prepare media lists for media group sending
+            photo_items = [(path, kind) for path, kind in prepared_items if kind == "photo"]
+            video_items = [(path, kind) for path, kind in prepared_items if kind == "video"]
 
-        # Try to send as media group first
-        if len(photo_items) > 1 or len(video_items) > 0:
-            # Combine photo and video items, photos first, then videos
-            all_items = photo_items + video_items
-            # Remove duplicates by path
-            seen_paths = set()
-            unique_items = []
-            for path, kind in all_items:
-                if path not in seen_paths:
-                    seen_paths.add(path)
-                    unique_items.append((path, kind))
-            all_items = unique_items
+            # Try to send as media group first
+            if len(photo_items) > 1 or len(video_items) > 0:
+                all_items = photo_items + video_items
+                seen_paths = set()
+                unique_items = []
+                for path, kind in all_items:
+                    if path not in seen_paths:
+                        seen_paths.add(path)
+                        unique_items.append((path, kind))
+                all_items = unique_items
 
-            sent = False
-            if len(all_items) > 1:
-                # Send as media group
-                sent = await send_media_group_isolated(context.bot, chat_id, all_items, caption)
+                sent = False
+                if len(all_items) > 1:
+                    sent = await send_media_group_isolated(context.bot, chat_id, all_items, caption)
+                    if not sent:
+                        logger.warning("Media group send failed, falling back to individual sends")
+
                 if not sent:
-                    logger.warning("Media group send failed, falling back to individual sends")
-
-            if not sent:
-                # Fallback: send individually (photos first, then videos)
-                for path, kind in photo_items:
-                    if cancelled_downloads.get(chat_id):
-                        await safe_edit(status_msg, "تم الإلغاء.")
-                        break
-                    try:
-                        await _send_photo_isolated(chat_id, path, caption, timeout=120)
-                        _cleanup_file(path)
-                    except Exception as e:
-                        logger.error(f"Failed to send photo: {e}")
-                        _cleanup_file(path)
-                for path, kind in video_items:
-                    if cancelled_downloads.get(chat_id):
-                        await safe_edit(status_msg, "تم الإلغاء.")
-                        break
-                    try:
-                        if path not in video_meta_cache:
-                            video_meta_cache[path] = await loop.run_in_executor(None, get_video_metadata, str(path))
-                        meta = video_meta_cache[path]
-                        if path not in thumb_cache:
-                            thumb_cache[path] = await loop.run_in_executor(None, extract_thumbnail, str(path))
-                        await _send_video_isolated(chat_id, path, caption, meta=meta, thumb_path=thumb_cache.get(path), timeout=300)
-                        _cleanup_file(path)
-                    except Exception as e:
-                        logger.error(f"Failed to send video: {e}")
-                        _cleanup_file(path)
-        else:
-            # Single item - send individually
-            for path, kind in prepared_items:
-                if cancelled_downloads.get(chat_id):
-                    await safe_edit(status_msg, "تم الإلغاء.")
-                    break
-
-                file_mb = os.path.getsize(path) / (1024 * 1024)
-                upload_timeout = 300 if kind == "video" else 120
-
-                for attempt in range(2):
-                    try:
-                        await safe_edit(status_msg, f"⬆️ رفع {prepared_items.index((path, kind))+1}/{len(prepared_items)} — {os.path.basename(path)} ({file_mb:.1f}MB)")
-                        if kind == "photo":
+                    for path, kind in photo_items:
+                        if status_id in cancelled_downloads:
+                            await safe_edit(status_msg, "تم الإلغاء.")
+                            break
+                        try:
                             await _send_photo_isolated(chat_id, path, caption, timeout=120)
-                        else:
+                            _cleanup_file(path)
+                        except Exception as e:
+                            logger.error(f"Failed to send photo: {e}")
+                            _cleanup_file(path)
+                    for path, kind in video_items:
+                        if status_id in cancelled_downloads:
+                            await safe_edit(status_msg, "تم الإلغاء.")
+                            break
+                        try:
                             if path not in video_meta_cache:
                                 video_meta_cache[path] = await loop.run_in_executor(None, get_video_metadata, str(path))
                             meta = video_meta_cache[path]
                             if path not in thumb_cache:
                                 thumb_cache[path] = await loop.run_in_executor(None, extract_thumbnail, str(path))
-                            await _send_video_isolated(chat_id, path, caption, meta=meta, thumb_path=thumb_cache.get(path), timeout=upload_timeout)
-                        logger.info(f"Sent {kind}: {os.path.basename(path)} ({file_mb:.1f}MB)")
+                            await _send_video_isolated(chat_id, path, caption, meta=meta, thumb_path=thumb_cache.get(path), timeout=300)
+                            _cleanup_file(path)
+                        except Exception as e:
+                            logger.error(f"Failed to send video: {e}")
+                            _cleanup_file(path)
+            else:
+                for path, kind in prepared_items:
+                    if status_id in cancelled_downloads:
+                        await safe_edit(status_msg, "تم الإلغاء.")
                         break
-                    except asyncio.TimeoutError:
-                        logger.error(f"Send timed out for {path} (attempt {attempt+1})")
-                        if attempt == 0:
-                            await safe_edit(status_msg, f"⚠️ رفع {os.path.basename(path)} ({file_mb:.1f}MB) علق — بجرب تاني...")
-                            await asyncio.sleep(2)
-                        else:
-                            await safe_edit(status_msg, f"❌ رفع {os.path.basename(path)} ({file_mb:.1f}MB) أخد وقت طويل — تم تخطيه.")
-                    except Exception as e:
-                        logger.error(f"Send failed for {path} (attempt {attempt+1}): {e}")
-                        if attempt == 0:
-                            await safe_edit(status_msg, f"⚠️ فشل {os.path.basename(path)} ({file_mb:.1f}MB) — بجرب تاني...")
-                            await asyncio.sleep(2)
-                        else:
-                            await safe_edit(status_msg, f"❌ فشل إرسال {os.path.basename(path)} ({file_mb:.1f}MB): {str(e)[:150]}")
-                _cleanup_file(path)
 
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
+                    file_mb = os.path.getsize(path) / (1024 * 1024)
+                    upload_timeout = 300 if kind == "video" else 120
+
+                    for attempt in range(2):
+                        try:
+                            await safe_edit(status_msg, f"⬆️ رفع {prepared_items.index((path, kind))+1}/{len(prepared_items)} — {os.path.basename(path)} ({file_mb:.1f}MB)")
+                            if kind == "photo":
+                                await _send_photo_isolated(chat_id, path, caption, timeout=120)
+                            else:
+                                if path not in video_meta_cache:
+                                    video_meta_cache[path] = await loop.run_in_executor(None, get_video_metadata, str(path))
+                                meta = video_meta_cache[path]
+                                if path not in thumb_cache:
+                                    thumb_cache[path] = await loop.run_in_executor(None, extract_thumbnail, str(path))
+                                await _send_video_isolated(chat_id, path, caption, meta=meta, thumb_path=thumb_cache.get(path), timeout=upload_timeout)
+                            logger.info(f"Sent {kind}: {os.path.basename(path)} ({file_mb:.1f}MB)")
+                            break
+                        except asyncio.TimeoutError:
+                            logger.error(f"Send timed out for {path} (attempt {attempt+1})")
+                            if attempt == 0:
+                                await safe_edit(status_msg, f"⚠️ رفع {os.path.basename(path)} ({file_mb:.1f}MB) علق — بجرب تاني...")
+                                await asyncio.sleep(2)
+                            else:
+                                await safe_edit(status_msg, f"❌ رفع {os.path.basename(path)} ({file_mb:.1f}MB) أخد وقت طويل — تم تخطيه.")
+                        except Exception as e:
+                            logger.error(f"Send failed for {path} (attempt {attempt+1}): {e}")
+                            if attempt == 0:
+                                await safe_edit(status_msg, f"⚠️ فشل {os.path.basename(path)} ({file_mb:.1f}MB) — بجرب تاني...")
+                                await asyncio.sleep(2)
+                            else:
+                                await safe_edit(status_msg, f"❌ فشل إرسال {os.path.basename(path)} ({file_mb:.1f}MB): {str(e)[:150]}")
+                    _cleanup_file(path)
+
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
 
     except asyncio.TimeoutError:
         logger.error(f"Timeout processing {url}")
@@ -1406,13 +1416,14 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     finally:
-        cancelled_downloads.pop(chat_id, None)
-        for f in DOWNLOAD_DIR.iterdir():
-            if f.is_file():
-                try:
-                    f.unlink()
-                except Exception:
-                    pass
+        if queued:
+            async with _queue_lock:
+                _waiting_count = max(0, _waiting_count - 1)
+        cancelled_downloads.discard(status_id)
+        try:
+            shutil.rmtree(req_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def main():
