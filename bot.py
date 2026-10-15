@@ -1,4 +1,14 @@
 import os
+import socket
+
+# Force IPv4 resolution to prevent connection failures (e.g. broken IPv6 routes on cloud hosts like Railway)
+_orig_getaddrinfo = socket.getaddrinfo
+def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    if family == 0:
+        family = socket.AF_INET
+    return _orig_getaddrinfo(host, port, family, type, proto, flags)
+socket.getaddrinfo = _ipv4_getaddrinfo
+
 import asyncio
 import logging
 import re
@@ -2060,7 +2070,15 @@ def main():
 
     init_db()
 
-    builder = Application.builder().token(BOT_TOKEN)
+    from telegram.request import HTTPXRequest
+
+    http_request = HTTPXRequest(
+        connection_pool_size=16,
+        connect_timeout=30.0,
+        read_timeout=60.0,
+        write_timeout=60.0,
+    )
+    builder = Application.builder().token(BOT_TOKEN).request(http_request)
 
     use_local = os.getenv("USE_LOCAL_SERVER", "false").lower() == "true"
     local_url = os.getenv("LOCAL_API_URL", "").strip()
@@ -2080,9 +2098,6 @@ def main():
         if server_alive:
             builder = builder.base_url(f"{local_url}/bot")
             builder = builder.base_file_url(f"{local_url}/file/bot")
-            builder = builder.connect_timeout(30)
-            builder = builder.read_timeout(300)
-            builder = builder.write_timeout(300)
             logger.info(f"Using LOCAL Bot API Server at {local_url} (2GB upload limit)")
         else:
             os.environ["USE_LOCAL_SERVER"] = "false"
@@ -2091,6 +2106,11 @@ def main():
         logger.info("Using Telegram Cloud API (50MB limit) + ffmpeg compression")
 
     application = builder.build()
+
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.error(f"Telegram error occurred: {context.error}")
+
+    application.add_error_handler(error_handler)
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", start))
