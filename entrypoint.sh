@@ -3,11 +3,14 @@ set -e
 
 LOCAL_PORT="8081"
 
-if [ -n "${TELEGRAM_API_ID}" ] && [ -n "${TELEGRAM_API_HASH}" ]; then
+CLEAN_API_ID=$(echo "${TELEGRAM_API_ID}" | tr -d ' "\r\n')
+CLEAN_API_HASH=$(echo "${TELEGRAM_API_HASH}" | tr -d ' "\r\n')
+
+if [ -n "${CLEAN_API_ID}" ] && [ -n "${CLEAN_API_HASH}" ]; then
     echo "[entrypoint] Starting Telegram Bot API Server on port ${LOCAL_PORT}..."
     telegram-bot-api \
-        --api-id="${TELEGRAM_API_ID}" \
-        --api-hash="${TELEGRAM_API_HASH}" \
+        --api-id="${CLEAN_API_ID}" \
+        --api-hash="${CLEAN_API_HASH}" \
         --http-port="${LOCAL_PORT}" \
         --local \
         --dir=/var/lib/telegram-bot-api \
@@ -34,6 +37,7 @@ if [ -n "${TELEGRAM_API_ID}" ] && [ -n "${TELEGRAM_API_HASH}" ]; then
         RETRIES=$((RETRIES + 1))
         if ! kill -0 $SERVER_PID 2>/dev/null; then
             echo "[entrypoint] WARN: Server process exited — falling back to cloud API"
+            wait $SERVER_PID 2>/dev/null || true
             break
         fi
         sleep 1

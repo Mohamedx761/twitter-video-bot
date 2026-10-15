@@ -14,6 +14,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=server /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
 RUN chmod +x /usr/local/bin/telegram-bot-api
 
+COPY --from=server /lib/ld-musl* /lib/
+COPY --from=server /lib/ /musl-lib/
+COPY --from=server /usr/lib/ /musl-usr-lib/
+
+RUN mkdir -p /etc && \
+    echo "/musl-lib" > /etc/ld-musl-x86_64.path && \
+    echo "/musl-usr-lib" >> /etc/ld-musl-x86_64.path && \
+    echo "/musl-lib" > /etc/ld-musl-aarch64.path && \
+    echo "/musl-usr-lib" >> /etc/ld-musl-aarch64.path
+
 RUN mkdir -p /var/lib/telegram-bot-api /tmp/telegram-bot-api
 
 WORKDIR /app

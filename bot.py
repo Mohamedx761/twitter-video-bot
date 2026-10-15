@@ -455,7 +455,7 @@ async def _curl_upload(api_url, endpoint, path, extra_fields=None, timeout=300, 
     return result
 
 
-async def _send_video_isolated(chat_id, path, caption, meta=None, thumb_path=None, timeout=300):
+async def _send_video_isolated(chat_id, path, caption, meta=None, thumb_path=None, timeout=600):
     """Upload video via isolated curl subprocess."""
     api_url = _get_api_url()
     fields = {"chat_id": str(chat_id), "supports_streaming": "true"}
@@ -481,7 +481,7 @@ async def _send_photo_isolated(chat_id, path, caption, timeout=120):
     return await _curl_upload(api_url, "sendPhoto", path, extra_fields=fields, timeout=timeout)
 
 
-async def _curl_upload_media_group(chat_id, media_items, caption="", timeout=300, thumb_map=None, meta_map=None):
+async def _curl_upload_media_group(chat_id, media_items, caption="", timeout=600, thumb_map=None, meta_map=None):
     """Upload an album (2-10 items of photos, videos, or mixed) via curl directly to Telegram Bot API."""
     if len(media_items) < 2:
         return False
@@ -993,7 +993,7 @@ def run_ytdlp_download(
     is_x: bool,
     use_cookies: bool,
     progress: dict = None,
-    timeout: int = 60,
+    timeout: int = 300,
 ) -> str:
     """Run yt-dlp download attempt with streaming output and timeout.
     Returns stderr text for diagnostics."""
@@ -1305,7 +1305,7 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
         if have_cookies_file:
             logger.info(f"Attempting download with cookies (is_x={is_x})...")
             try:
-                last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=True, progress=progress, timeout=60)
+                last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=True, progress=progress, timeout=300)
             except Exception as e:
                 logger.warning(f"Download with cookies failed: {e}")
                 last_stderr = str(e)
@@ -1315,14 +1315,14 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
             if not (after_files - before_files):
                 logger.info("No media found using cookies. Retrying WITHOUT cookies as fallback...")
                 try:
-                    last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=False, progress=progress, timeout=60)
+                    last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=False, progress=progress, timeout=300)
                 except Exception as e:
                     logger.warning(f"Fallback download without cookies failed: {e}")
                     last_stderr = str(e)
         else:
             logger.info(f"Attempting download without cookies (is_x={is_x})...")
             try:
-                last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=False, progress=progress, timeout=60)
+                last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=False, progress=progress, timeout=300)
             except Exception as e:
                 logger.warning(f"Download without cookies failed: {e}")
                 last_stderr = str(e)
@@ -1881,10 +1881,10 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
                     loop.run_in_executor(
                         None, extract_media, url, req_dir, chat_id, status_id, context.application, progress
                     ),
-                    timeout=140,
+                    timeout=600,
                 )
             except asyncio.TimeoutError:
-                await notify_stopped("استغرق التحميل وقتاً طويلاً (تجاوزت المهلة دقيقتين) وتوقف.")
+                await notify_stopped("استغرق التحميل وقتاً طويلاً (تجاوزت المهلة 10 دقائق) وتوقف.")
                 return
             finally:
                 poll_task.cancel()
