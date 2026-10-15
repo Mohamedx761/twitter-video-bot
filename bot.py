@@ -236,18 +236,27 @@ def compress_video(input_path: str, output_path: str, target_mb: float = 49.0) -
     if size_bytes <= target_bytes:
         return False
 
-    audio_bitrate_kbps = 128
+    audio_bitrate_kbps = 96 if duration > 600 else 128
     total_bitrate = (target_bytes * 8 * 0.95) / duration
-    video_bitrate_kbps = max(100, int((total_bitrate / 1000) - audio_bitrate_kbps))
+    video_bitrate_kbps = max(50, int((total_bitrate / 1000) - audio_bitrate_kbps))
 
-    if video_bitrate_kbps < 300:
+    if video_bitrate_kbps < 100:
         minutes = int(duration // 60)
         size_mb = int(size_bytes / (1024 * 1024))
         raise ValueError(
-            f"الفيديو كبير جداً ({size_mb}MB، {minutes} دقيقة).\n"
-            f"الحد الأقصى للإرسال هو 50MB، والضغط ممكن يخلي الجودة سيئة جداً.\n"
+            f"الفيديو طويل جداً ({minutes} دقيقة، {size_mb}MB).\n"
+            f"الحد الأقصى للإرسال على تيليجرام هو 50MB، وضغط فيديو بهذه المدة الطويلة سيفقده الجودة تماماً.\n"
             f"جرب تبعت فيديو أقصر أو أصغر."
         )
+
+    scale_filter = []
+    if video_bitrate_kbps < 300:
+        scale_filter = ["-vf", "scale=min(640,iw):-2"]
+    elif video_bitrate_kbps < 600:
+        scale_filter = ["-vf", "scale=min(854,iw):-2"]
+    elif video_bitrate_kbps < 1200:
+        scale_filter = ["-vf", "scale=min(1280,iw):-2"]
+
     maxrate_kbps = int(video_bitrate_kbps * 1.5)
     bufsize_kbps = int(video_bitrate_kbps * 2)
 
@@ -259,12 +268,16 @@ def compress_video(input_path: str, output_path: str, target_mb: float = 49.0) -
         "-b:v", f"{video_bitrate_kbps}k",
         "-maxrate", f"{maxrate_kbps}k",
         "-bufsize", f"{bufsize_kbps}k",
+    ]
+    if scale_filter:
+        cmd.extend(scale_filter)
+    cmd.extend([
         "-preset", "fast",
         "-c:a", "aac",
         "-b:a", f"{audio_bitrate_kbps}k",
         "-movflags", "+faststart",
         output_path,
-    ]
+    ])
 
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -1970,26 +1983,35 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
                         pass
                 prepared_items.append((use_path, "photo"))
 
-            upload_limit_mb = 2000 if use_local else 50
             for video_path in videos:
                 if not os.path.exists(video_path):
                     continue
                 file_mb = os.path.getsize(video_path) / (1024 * 1024)
-                if file_mb > upload_limit_mb:
-                    await notify_stopped(f"حجم الفيديو ({file_mb:.1f}MB) كبير جداً ويتجاوز الحد الأقصى ({upload_limit_mb}MB).")
-                    return
-                elif not use_local and file_mb > 50:
-                    cpath = str(video_path) + ".compressed.mp4"
-                    try:
-                        compressed = await loop.run_in_executor(None, compress_video, video_path, cpath, 49.0)
-                        prepared_items.append((cpath if compressed and os.path.exists(cpath) else video_path, "video"))
-                    except ValueError as ve:
-                        await notify_stopped(str(ve))
+
+                if use_local:
+                    if file_mb > 2000:
+                        await notify_stopped(f"حجم الفيديو ({file_mb:.1f}MB) كبير جداً ويتجاوز الحد الأقصى لسيرفر تيليجرام (2000MB).")
                         return
-                else:
-                    if use_local:
-                        await loop.run_in_executor(None, ensure_faststart, video_path)
+                    await loop.run_in_executor(None, ensure_faststart, video_path)
                     prepared_items.append((video_path, "video"))
+                else:
+                    if file_mb > 50:
+                        await safe_edit(status_msg, f"⏳ حجم الفيديو ({file_mb:.1f}MB) — جاري ضغطه ليناسب إرسال تيليجرام (أقل من 50MB)...")
+                        cpath = str(video_path) + ".compressed.mp4"
+                        try:
+                            compressed = await loop.run_in_executor(None, compress_video, video_path, cpath, 49.0)
+                            if compressed and os.path.exists(cpath) and os.path.getsize(cpath) <= 50 * 1024 * 1024:
+                                prepared_items.append((cpath, "video"))
+                            elif os.path.getsize(video_path) <= 50 * 1024 * 1024:
+                                prepared_items.append((video_path, "video"))
+                            else:
+                                await notify_stopped(f"تعذر ضغط الفيديو ({file_mb:.1f}MB) لحجم أقل من 50MB.")
+                                return
+                        except ValueError as ve:
+                            await notify_stopped(str(ve))
+                            return
+                    else:
+                        prepared_items.append((video_path, "video"))
 
             seen_paths = set()
             unique_items = []
