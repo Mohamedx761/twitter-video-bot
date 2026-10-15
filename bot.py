@@ -37,6 +37,14 @@ from telegram.ext import (
     ContextTypes,
 )
 
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip().strip('"').strip("'")
@@ -44,7 +52,7 @@ AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0").strip().strip('"')
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads").strip().strip('"').strip("'"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip().strip('"').strip("'")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-BOT_VERSION = "v2.4-channel-archive-anti-duplicate"
+BOT_VERSION = "v2.5-clean-optimized"
 
 DB_PATH = Path("archive.db")
 
@@ -97,6 +105,9 @@ def get_canonical_post_id(url: str) -> tuple[str, str]:
     if m:
         return f"tt_{m.group(1)}", "TikTok"
     m = re.search(r"(?:facebook|fb)\.com/.*/(?:videos|posts|reel)/(\d+)", url, re.I)
+    if m:
+        return f"fb_{m.group(1)}", "Facebook"
+    m = re.search(r"(?:facebook|fb)\.com/watch/?\?v=(\d+)", url, re.I)
     if m:
         return f"fb_{m.group(1)}", "Facebook"
     return "url_" + hashlib.sha256(clean_url.encode()).hexdigest()[:20], "Media"
@@ -301,15 +312,6 @@ def get_cookie_args() -> list:
             return ["--cookies", p]
     return []
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-logger = logging.getLogger(__name__)
-
-
 class SimpleHealthServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -352,6 +354,7 @@ URL_PATTERNS = [
     r"(https?://)?(www\.)?(x\.com|twitter\.com)/\S+/status/\d+",
     r"(https?://)?(www\.)?(instagram\.com)/(p|reel|tv|stories)/\S+",
     r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/.*/(videos|posts)/\S+",
+    r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/watch\S*",
     r"(https?://)?fb\.watch/\S+",
     r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/reel/\S+",
     r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/share/\S+",
@@ -378,17 +381,6 @@ def extract_url(text: str) -> str:
     return None
 
 
-def is_valid_url(url: str) -> bool:
-    return extract_url(url) is not None
-
-
-def make_progress_bar(percent: int) -> str:
-    filled = int(percent / 5)
-    empty = 20 - filled
-    bar = "█" * filled + "░" * empty
-    return f"[{bar}] {percent}%"
-
-
 cancel_keyboard = InlineKeyboardMarkup(
     [[InlineKeyboardButton("Cancel", callback_data="cancel_download")]]
 )
@@ -400,30 +392,6 @@ start_keyboard = ReplyKeyboardMarkup(
 
 VIDEO_EXTS = ('.mp4', '.mkv', '.webm', '.mov')
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.gif', '.webp')
-
-
-def _cleanup_file(path):
-    """Delete a file and its thumbnails to free memory.
-    Only deletes the exact file and its direct thumbnail variants, NOT siblings."""
-    try:
-        p = Path(path)
-        if p.exists():
-            p.unlink()
-        for ext in ('.jpg', '.webp', '.png', '.jpeg'):
-            thumb = p.with_suffix(p.suffix + ext)
-            if thumb.exists():
-                thumb.unlink()
-        thumb_direct = Path(str(p) + ".thumb.jpg")
-        if thumb_direct.exists():
-            thumb_direct.unlink()
-        compressed = Path(str(p) + ".compressed.mp4")
-        if compressed.exists():
-            compressed.unlink()
-        compressed_jpg = Path(str(p) + ".compressed.jpg")
-        if compressed_jpg.exists():
-            compressed_jpg.unlink()
-    except Exception:
-        pass
 
 
 def _get_api_url():
@@ -626,7 +594,6 @@ async def send_media_group_isolated(bot, chat_id, media_list, caption="", thumb_
         logger.warning(f"Curl media group upload failed, trying python-telegram-bot fallback: {e}")
 
     # Attempt 2: python-telegram-bot fallback with properly opened binary files
-    from telegram import InputMediaPhoto, InputMediaVideo
     file_handles = []
     try:
         grouped_media = []
@@ -689,34 +656,6 @@ def dedupe_thumbnails(file_paths):
         if not is_thumb:
             result.append(img)
     return result
-
-
-def get_json_info(url: str) -> dict:
-    cmd = [
-        "yt-dlp",
-        "--dump-single-json",
-        "--no-download",
-        "--no-warnings",
-        "--no-check-certificates",
-        "--extractor-retries", "3",
-        "--retry-sleep", "1",
-    ] + get_cookie_args() + [url]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if result.stdout.strip():
-            try:
-                data = json.loads(result.stdout.strip())
-            except json.JSONDecodeError:
-                logger.error(f"JSON parse failed: {result.stdout.strip()[:200]}")
-                data = None
-            if isinstance(data, dict):
-                logger.info(f"get_json_info keys: {list(data.keys())[:15]}")
-                return data
-            else:
-                logger.error(f"get_json_info returned non-dict: {type(data)}")
-    except Exception as e:
-        logger.error(f"JSON fetch failed: {e}")
-    return {}
 
 
 def _best_str_url(value):
@@ -848,8 +787,13 @@ def extract_thumbnail(video_path: str) -> str | None:
             return thumb_path
     except Exception as e:
         logger.warning(f"Thumbnail extraction failed: {e}")
-        if os.path.exists(raw_thumb):
-            os.remove(raw_thumb)
+    finally:
+        for tmp_file in (raw_thumb, thumb_path + ".small.jpg"):
+            try:
+                if os.path.exists(tmp_file):
+                    os.remove(tmp_file)
+            except Exception:
+                pass
     return None
 
 
@@ -2150,7 +2094,6 @@ def main():
     start_health_check_server()
     logger.info("Bot started")
 
-    import time
     while True:
         try:
             application.run_polling(allowed_updates=Update.ALL_TYPES)
