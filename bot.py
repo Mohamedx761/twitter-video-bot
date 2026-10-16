@@ -52,7 +52,7 @@ AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0").strip().strip('"')
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads").strip().strip('"').strip("'"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip().strip('"').strip("'")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-BOT_VERSION = "v2.5-clean-optimized"
+BOT_VERSION = "v2.6-tiktok-lite-and-photos"
 
 DB_PATH = Path("archive.db")
 
@@ -98,10 +98,13 @@ def get_canonical_post_id(url: str) -> tuple[str, str]:
     m = re.search(r"instagram\.com/(?:p|reel|tv|stories)/([A-Za-z0-9_-]+)", url, re.I)
     if m:
         return f"ig_{m.group(1)}", "Instagram"
-    m = re.search(r"tiktok\.com/@[^/]+/video/(\d+)", url, re.I)
+    m = re.search(r"tiktok\.com/@[^/]+/(?:video|photo)/(\d+)", url, re.I)
     if m:
         return f"tt_{m.group(1)}", "TikTok"
-    m = re.search(r"vm\.tiktok\.com/([A-Za-z0-9_-]+)", url, re.I)
+    m = re.search(r"(?:vm|vt|lite)\.tiktok\.com/([A-Za-z0-9_-]+)", url, re.I)
+    if m:
+        return f"tt_{m.group(1)}", "TikTok"
+    m = re.search(r"tiktok\.com/t/([A-Za-z0-9_-]+)", url, re.I)
     if m:
         return f"tt_{m.group(1)}", "TikTok"
     m = re.search(r"(?:facebook|fb)\.com/.*/(?:videos|posts|reel)/(\d+)", url, re.I)
@@ -351,30 +354,41 @@ def is_authorized(user_id: int) -> bool:
 
 
 URL_PATTERNS = [
-    r"(https?://)?(www\.)?(x\.com|twitter\.com)/\S+/status/\d+",
-    r"(https?://)?(www\.)?(instagram\.com)/(p|reel|tv|stories)/\S+",
-    r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/.*/(videos|posts)/\S+",
-    r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/watch\S*",
-    r"(https?://)?fb\.watch/\S+",
-    r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/reel/\S+",
-    r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/share/\S+",
-    r"(https?://)?(www\.|m\.|web\.)*(facebook|fb)\.com/permalink\.php\S*",
-    r"(https?://)?vm\.tiktok\.com/\S+",
-    r"(https?://)?(www\.)?tiktok\.com/@\S+/video/\d+",
+    # X / Twitter
+    r"(?:https?://)?(?:www\.)?(?:x|twitter)\.com/[^\s/]+/status/\d+\S*",
+    # Instagram
+    r"(?:https?://)?(?:www\.)?instagram\.com/(?:p|reel|reels|tv|stories)/[A-Za-z0-9_-]+\S*",
+    # TikTok (all post, album, and shortlink formats)
+    r"(?:https?://)?(?:www\.|m\.|lite\.)?tiktok\.com/@[\w\.-]+/(?:video|photo)/\d+\S*",
+    r"(?:https?://)?(?:www\.|m\.|lite\.)?tiktok\.com/t/[A-Za-z0-9_-]+\S*",
+    r"(?:https?://)?(?:vm|vt|lite)\.tiktok\.com/[A-Za-z0-9_-]+\S*",
+    r"(?:https?://)?(?:www\.|m\.)?tiktok\.com/v/\d+\S*",
+    # Facebook
+    r"(?:https?://)?(?:www\.|m\.|web\.)*(?:facebook|fb)\.com/.*/(?:videos|posts)/\S+",
+    r"(?:https?://)?(?:www\.|m\.|web\.)*(?:facebook|fb)\.com/watch\S*",
+    r"(?:https?://)?fb\.watch/\S+",
+    r"(?:https?://)?(?:www\.|m\.|web\.)*(?:facebook|fb)\.com/reel/\S+",
+    r"(?:https?://)?(?:www\.|m\.|web\.)*(?:facebook|fb)\.com/share/\S+",
+    r"(?:https?://)?(?:www\.|m\.|web\.)*(?:facebook|fb)\.com/permalink\.php\S*",
 ]
 
 
 def extract_url(text: str) -> str:
     """Find the first supported link anywhere inside the message text
-    (not just when the whole message is a bare URL), and return a clean
-    URL string usable by yt-dlp."""
+    (including cluttered share messages from TikTok/TikTok Lite),
+    while explicitly filtering out promotional/app-store links."""
     text = text.strip()
+    promo_patterns = [
+        r"tiktok\.com/(?:tiktoklite|download|app|about|legal|privacy)(?:/|\?|$)",
+        r"instagram\.com/(?:about|legal|download)(?:/|\?|$)",
+        r"(?:x|twitter)\.com/(?:download|about)(?:/|\?|$)",
+    ]
+
     for pattern in URL_PATTERNS:
-        match = re.search(pattern, text)
-        if match:
-            url = match.group(0)
-            # Trim trailing punctuation that's likely not part of the URL
-            url = url.rstrip(".,!?;:)>]\"'")
+        for match in re.finditer(pattern, text):
+            url = match.group(0).rstrip(".,!?;:)>]\"'")
+            if any(re.search(promo, url, re.I) for promo in promo_patterns):
+                continue
             if not url.lower().startswith("http"):
                 url = "https://" + url
             return url
@@ -798,10 +812,16 @@ def extract_thumbnail(video_path: str) -> str | None:
 
 
 def _download_direct_url(url: str, dest: Path, timeout: int = 300, progress_cb=None) -> bool:
-    """Download a direct URL (e.g. Twitter CDN MP4) via urllib with proper headers."""
+    """Download a direct URL (e.g. Twitter/TikTok CDN MP4 or photo) via urllib with proper headers."""
+    referer = "https://x.com/"
+    if "tiktok" in url or "tiktokcdn" in url or "tikwm" in url:
+        referer = "https://www.tiktok.com/"
+    elif "instagram" in url or "cdninstagram" in url:
+        referer = "https://www.instagram.com/"
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Referer": "https://x.com/",
+        "Referer": referer,
     }
     try:
         req = urllib.request.Request(url, headers=headers)
@@ -824,7 +844,14 @@ def _download_direct_url(url: str, dest: Path, timeout: int = 300, progress_cb=N
 
 
 def download_image_ytdlp(image_url: str, download_path: Path, idx: int, progress_cb=None) -> str:
-    is_video = ".mp4" in image_url or "video.twimg.com" in image_url
+    is_video = (
+        ".mp4" in image_url.lower()
+        or "video.twimg.com" in image_url
+        or "mime_type=video_mp4" in image_url
+        or "/video/" in image_url
+        or "tiktokcdn" in image_url
+        or "/play/" in image_url
+    )
     ext = "mp4" if is_video else "jpg"
     if ".png" in image_url.lower():
         ext = "png"
@@ -832,8 +859,14 @@ def download_image_ytdlp(image_url: str, download_path: Path, idx: int, progress
         ext = "webp"
     fpath = download_path / f"{idx:05d}.{ext}"
 
-    # If it is a direct image URL (including pbs.twimg.com) or Twitter CDN video, download directly via HTTP!
-    if "twimg.com" in image_url or re.search(r"\.(jpg|jpeg|png|webp|mp4)(\?|$)", image_url, re.I):
+    # If it is a direct image URL (including pbs.twimg.com) or Twitter/TikTok CDN video, download directly via HTTP!
+    if (
+        "twimg.com" in image_url
+        or "tiktokcdn" in image_url
+        or "tikwm.com" in image_url
+        or "mime_type=video_mp4" in image_url
+        or re.search(r"\.(jpg|jpeg|png|webp|mp4)(\?|$)", image_url, re.I)
+    ):
         logger.info(f"Direct downloading media ({'video' if is_video else 'photo'}): {image_url[:80]}")
         if _download_direct_url(image_url, fpath, progress_cb=progress_cb):
             return str(fpath)
@@ -1263,6 +1296,47 @@ def get_x_media(url: str) -> tuple[dict, list]:
     return info, media_urls
 
 
+def get_tiktok_media(url: str) -> tuple[dict, list]:
+    """Fetch direct watermark-free video or photo album URLs from TikTok via TikWM API.
+    Guarantees fast, reliable extraction for videos and photo slideshows without yt-dlp blocks."""
+    api_url = "https://www.tikwm.com/api/"
+    post_data = urllib.parse.urlencode({"url": url, "hd": 1}).encode("utf-8")
+    req = urllib.request.Request(
+        api_url,
+        data=post_data,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            if data.get("code") == 0 and "data" in data:
+                d = data["data"]
+                info = {
+                    "title": d.get("title", ""),
+                    "description": d.get("title", ""),
+                    "uploader": (d.get("author") or {}).get("nickname", ""),
+                    "id": str(d.get("id", "")),
+                }
+                # Check for Photo Mode (images album)
+                images = d.get("images")
+                if isinstance(images, list) and images:
+                    valid_imgs = [img for img in images if isinstance(img, str) and img.startswith("http")]
+                    logger.info(f"TikWM API found {len(valid_imgs)} photo(s) in TikTok album")
+                    return info, valid_imgs
+
+                # Check for Video (hdplay preferred, then play, then wmplay)
+                video_url = d.get("hdplay") or d.get("play") or d.get("wmplay")
+                if video_url:
+                    logger.info("TikWM API found direct TikTok video URL")
+                    return info, [video_url]
+    except Exception as e:
+        logger.warning(f"TikWM API attempt failed for {url}: {e}")
+    return {}, []
+
+
 def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: int, app: Application, progress: dict = None) -> tuple[dict, list]:
     downloaded_files = []
     before_files = set(f.name for f in download_path.iterdir() if f.is_file())
@@ -1278,8 +1352,14 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
         "instagram.com" in url_lower
         or "tiktok.com" in url_lower
         or "vm.tiktok.com" in url_lower
+        or "vt.tiktok.com" in url_lower
     )
     is_x = "twitter.com" in url_lower or "x.com" in url_lower
+    is_tiktok = (
+        "tiktok.com" in url_lower
+        or "vm.tiktok.com" in url_lower
+        or "vt.tiktok.com" in url_lower
+    )
 
     _cookie_paths = [COOKIES_FILE, "cookies.txt"] if COOKIES_FILE else ["cookies.txt"]
     have_cookies_file = any(Path(p).exists() for p in _cookie_paths if p)
@@ -1297,6 +1377,17 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
             if not info and x_info:
                 info = x_info
             for u in x_urls:
+                if u not in all_image_urls:
+                    all_image_urls.append(u)
+
+    # For TikTok, first try direct API extraction for watermark-free videos and photo albums
+    if is_tiktok and not all_image_urls:
+        tt_info, tt_urls = get_tiktok_media(url)
+        if tt_urls:
+            logger.info(f"TikTok direct extraction: {len(tt_urls)} media item(s) found")
+            if not info and tt_info:
+                info = tt_info
+            for u in tt_urls:
                 if u not in all_image_urls:
                     all_image_urls.append(u)
 
@@ -1339,6 +1430,17 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
                         if u not in all_image_urls:
                             all_image_urls.append(u)
 
+        if is_tiktok:
+            after_files = set(f.name for f in download_path.iterdir() if f.is_file() and not f.name.endswith(".info.json"))
+            if not (after_files - before_files) and not all_image_urls:
+                tt_info, tt_urls = get_tiktok_media(url)
+                if tt_urls:
+                    if not info and tt_info:
+                        info = tt_info
+                    for u in tt_urls:
+                        if u not in all_image_urls:
+                            all_image_urls.append(u)
+
     for f in sorted(download_path.glob("*.info.json")):
         try:
             with open(f) as fp:
@@ -1355,7 +1457,11 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
             continue
     logger.info(f"All info files parsed")
 
-    is_tiktok = "tiktok.com" in url_lower or "vm.tiktok.com" in url_lower
+    is_tiktok = (
+        "tiktok.com" in url_lower
+        or "vm.tiktok.com" in url_lower
+        or "vt.tiktok.com" in url_lower
+    )
 
     if is_carousel and not all_image_urls:
         if is_tiktok:
@@ -1456,7 +1562,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- X/Twitter videos and images (Photo & Video Albums 📸🎬)\n"
         "- Instagram posts, reels, stories\n"
         "- Facebook videos and reels\n"
-        "- TikTok videos\n\n"
+        "- TikTok videos and photo albums (Photo & Video Albums 📸🎬)\n\n"
         f"🤖 الإصدار النشط: {BOT_VERSION}\n"
         f"📁 {arch_status}",
         parse_mode="HTML",
