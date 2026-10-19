@@ -1,4 +1,4 @@
-FROM ghcr.io/gramiojs/telegram-bot-api:latest AS server
+FROM ghcr.io/jakbin/telegram-bot-api-binary:main AS server-src
 
 FROM python:3.12-slim-bookworm
 
@@ -9,20 +9,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
     ca-certificates \
+    libssl3 \
+    zlib1g \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=server /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
+COPY --from=server-src /telegram-bot-api /usr/local/bin/telegram-bot-api
 RUN chmod +x /usr/local/bin/telegram-bot-api
-
-COPY --from=server /lib/ld-musl* /lib/
-COPY --from=server /lib/ /musl-lib/
-COPY --from=server /usr/lib/ /musl-usr-lib/
-
-RUN mkdir -p /etc && \
-    echo "/musl-lib" > /etc/ld-musl-x86_64.path && \
-    echo "/musl-usr-lib" >> /etc/ld-musl-x86_64.path && \
-    echo "/musl-lib" > /etc/ld-musl-aarch64.path && \
-    echo "/musl-usr-lib" >> /etc/ld-musl-aarch64.path
 
 RUN mkdir -p /var/lib/telegram-bot-api /tmp/telegram-bot-api
 

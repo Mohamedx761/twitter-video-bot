@@ -1,13 +1,16 @@
 import os
 import socket
 
-# Force IPv4 resolution to prevent connection failures (e.g. broken IPv6 routes on cloud hosts like Railway)
+# Smart IPv4/IPv6 resolution: prefers IPv4 to avoid broken IPv6 routes on cloud hosts, with automatic fallback
 _orig_getaddrinfo = socket.getaddrinfo
-def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+def _smart_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
     if family == 0:
-        family = socket.AF_INET
+        try:
+            return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+        except Exception:
+            return _orig_getaddrinfo(host, port, 0, type, proto, flags)
     return _orig_getaddrinfo(host, port, family, type, proto, flags)
-socket.getaddrinfo = _ipv4_getaddrinfo
+socket.getaddrinfo = _smart_getaddrinfo
 
 import asyncio
 import logging
@@ -52,7 +55,7 @@ AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0").strip().strip('"')
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads").strip().strip('"').strip("'"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip().strip('"').strip("'")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-BOT_VERSION = "v2.6-tiktok-lite-and-photos"
+BOT_VERSION = "v2.7-resilient-network-and-api"
 
 DB_PATH = Path("archive.db")
 
@@ -315,8 +318,20 @@ def get_cookie_args() -> list:
             return ["--cookies", p]
     return []
 
+_consecutive_connect_errors = 0
+
+
 class SimpleHealthServer(BaseHTTPRequestHandler):
     def do_GET(self):
+        global _consecutive_connect_errors
+        # If the bot has suffered 6+ consecutive connection errors, signal 503 so health checks notice
+        if _consecutive_connect_errors >= 6:
+            self.send_response(503)
+            self.send_header("Content-type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"Bot disconnected from Telegram\n")
+            return
+
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
@@ -2146,7 +2161,7 @@ def main():
 
     http_request = HTTPXRequest(
         connection_pool_size=16,
-        connect_timeout=30.0,
+        connect_timeout=15.0,
         read_timeout=60.0,
         write_timeout=60.0,
     )
@@ -2180,7 +2195,53 @@ def main():
     application = builder.build()
 
     async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.error(f"Telegram error occurred: {context.error}")
+        global _consecutive_connect_errors
+        err = context.error
+        err_str = str(err)
+
+        is_conn_error = (
+            isinstance(err, (TelegramError, Exception))
+            and (
+                "ConnectError" in err_str
+                or "All connection attempts failed" in err_str
+                or "ConnectTimeout" in err_str
+                or "NetworkError" in err_str
+                or "Network is unreachable" in err_str
+                or "Connection refused" in err_str
+                or "timed out" in err_str
+            )
+        )
+
+        if is_conn_error:
+            _consecutive_connect_errors += 1
+            current_base_url = getattr(context.bot, "_base_url", "")
+            logger.error(
+                f"Telegram connection error #{_consecutive_connect_errors}: {err} (target: {current_base_url})"
+            )
+
+            # If using local server and it fails 2 times consecutively: fall back immediately to Telegram Cloud API!
+            if "127.0.0.1" in current_base_url or "localhost" in current_base_url:
+                if _consecutive_connect_errors >= 2:
+                    logger.warning(
+                        f"Local Bot API server at {current_base_url} is unreachable ({_consecutive_connect_errors} failures). "
+                        "Switching immediately to official Telegram Cloud API (api.telegram.org)!"
+                    )
+                    context.bot._base_url = f"https://api.telegram.org/bot{BOT_TOKEN}"
+                    context.bot._base_file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
+                    os.environ["USE_LOCAL_SERVER"] = "false"
+                    _consecutive_connect_errors = 0
+                    return
+
+            # If on Cloud API and we have 6 consecutive connection errors (~2 minutes):
+            if _consecutive_connect_errors >= 6:
+                logger.critical(
+                    f"Unrecoverable connection failure to Telegram ({_consecutive_connect_errors} consecutive errors). "
+                    "Restarting container process for clean network reconnect..."
+                )
+                os._exit(1)
+        else:
+            _consecutive_connect_errors = 0
+            logger.error(f"Telegram error occurred: {err}")
 
     application.add_error_handler(error_handler)
 
