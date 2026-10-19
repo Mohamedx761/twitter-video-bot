@@ -55,7 +55,7 @@ AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0").strip().strip('"')
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads").strip().strip('"').strip("'"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip().strip('"').strip("'")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-BOT_VERSION = "v2.7-resilient-network-and-api"
+BOT_VERSION = "v2.8-anti-freeze-and-live-upload-timer"
 
 DB_PATH = Path("archive.db")
 
@@ -297,7 +297,7 @@ def compress_video(input_path: str, output_path: str, target_mb: float = 49.0) -
     ])
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         if proc.returncode != 0:
             logger.error(f"ffmpeg error: {proc.stderr[:500]}")
             return False
@@ -432,8 +432,7 @@ def _get_api_url():
 
 
 async def _curl_upload(api_url, endpoint, path, extra_fields=None, timeout=300, thumb_path=None):
-    """Run curl in a subprocess with EXPLICIT lifecycle management.
-    Uses asyncio.wait (NOT wait_for) so we control the kill ourselves."""
+    """Run curl in a subprocess with EXPLICIT lifecycle management and Cloud API fallback."""
     cmd = [
         "curl", "-s", "-S", "-X", "POST",
         f"{api_url}/{endpoint}",
@@ -470,21 +469,69 @@ async def _curl_upload(api_url, endpoint, path, extra_fields=None, timeout=300, 
             pass
         await asyncio.wait(pending, timeout=5)
         comm_task.cancel()
+
+        # If local server timed out, retry immediately on Telegram Cloud API!
+        if "127.0.0.1" in api_url or "localhost" in api_url:
+            cloud_url = f"https://api.telegram.org/bot{BOT_TOKEN}"
+            logger.warning(f"[upload] Local server timed out on {endpoint}. Retrying on Cloud API...")
+            cmd_cloud = list(cmd)
+            for ci, carg in enumerate(cmd_cloud):
+                if f"{api_url}/{endpoint}" in carg:
+                    cmd_cloud[ci] = f"{cloud_url}/{endpoint}"
+            try:
+                proc2 = await asyncio.create_subprocess_exec(
+                    *cmd_cloud,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout2, stderr2 = await asyncio.wait_for(proc2.communicate(), timeout=timeout)
+                out2 = stdout2.decode(errors="replace").strip()
+                res2 = json.loads(out2) if out2 else {}
+                if res2.get("ok"):
+                    logger.info(f"[upload] {endpoint} succeeded via Cloud API fallback after local timeout")
+                    return res2
+            except Exception as ce:
+                logger.error(f"[upload] Cloud fallback after timeout failed: {ce}")
+
         raise asyncio.TimeoutError(f"Upload timed out after {timeout}s")
 
     stdout, stderr = comm_task.result()
     output = stdout.decode(errors="replace").strip()
-    if proc.returncode not in (0, None):
-        err = stderr.decode(errors="replace").strip()[:300]
-        raise Exception(f"curl rc={proc.returncode}: {err}")
-
     result = json.loads(output) if output else {}
-    if not result.get("ok"):
-        raise Exception(f"Telegram: {result.get('description', output[:200])}")
+
+    # If failed on local server, fallback to official Telegram Cloud API immediately!
+    if proc.returncode not in (0, None) or not result.get("ok"):
+        err = result.get('description', output[:200]) if result else stderr.decode(errors="replace").strip()[:300]
+        if "127.0.0.1" in api_url or "localhost" in api_url:
+            cloud_url = f"https://api.telegram.org/bot{BOT_TOKEN}"
+            logger.warning(f"[upload] Local server returned error for {endpoint} ({err}). Retrying via Cloud API...")
+            cmd_cloud = list(cmd)
+            for ci, carg in enumerate(cmd_cloud):
+                if f"{api_url}/{endpoint}" in carg:
+                    cmd_cloud[ci] = f"{cloud_url}/{endpoint}"
+            try:
+                proc2 = await asyncio.create_subprocess_exec(
+                    *cmd_cloud,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout2, stderr2 = await asyncio.wait_for(proc2.communicate(), timeout=timeout)
+                out2 = stdout2.decode(errors="replace").strip()
+                res2 = json.loads(out2) if out2 else {}
+                if res2.get("ok"):
+                    logger.info(f"[upload] {endpoint} succeeded via Cloud API fallback")
+                    return res2
+            except Exception as ce:
+                logger.error(f"[upload] Cloud API fallback failed: {ce}")
+
+        if proc.returncode not in (0, None):
+            raise Exception(f"curl rc={proc.returncode}: {err}")
+        raise Exception(f"Telegram: {err}")
+
     return result
 
 
-async def _send_video_isolated(chat_id, path, caption, meta=None, thumb_path=None, timeout=600):
+async def _send_video_isolated(chat_id, path, caption, meta=None, thumb_path=None, timeout=300):
     """Upload video via isolated curl subprocess."""
     api_url = _get_api_url()
     fields = {"chat_id": str(chat_id), "supports_streaming": "true"}
@@ -1041,7 +1088,7 @@ def run_ytdlp_download(
     is_x: bool,
     use_cookies: bool,
     progress: dict = None,
-    timeout: int = 300,
+    timeout: int = 90,
 ) -> str:
     """Run yt-dlp download attempt with streaming output and timeout.
     Returns stderr text for diagnostics."""
@@ -1353,6 +1400,10 @@ def get_tiktok_media(url: str) -> tuple[dict, list]:
 
 
 def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: int, app: Application, progress: dict = None) -> tuple[dict, list]:
+    if status_msg_id in cancelled_downloads:
+        logger.info(f"Download cancelled by user before extract: {url}")
+        return {}, []
+
     downloaded_files = []
     before_files = set(f.name for f in download_path.iterdir() if f.is_file())
 
@@ -1406,29 +1457,35 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
                 if u not in all_image_urls:
                     all_image_urls.append(u)
 
+    if status_msg_id in cancelled_downloads:
+        return {}, []
+
     # If not X, or if direct X extraction found nothing, run yt-dlp
     if not all_image_urls:
         if have_cookies_file:
             logger.info(f"Attempting download with cookies (is_x={is_x})...")
             try:
-                last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=True, progress=progress, timeout=300)
+                last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=True, progress=progress, timeout=90)
             except Exception as e:
                 logger.warning(f"Download with cookies failed: {e}")
                 last_stderr = str(e)
+
+            if status_msg_id in cancelled_downloads:
+                return {}, []
 
             # Check if any media was downloaded
             after_files = set(f.name for f in download_path.iterdir() if f.is_file() and not f.name.endswith(".info.json"))
             if not (after_files - before_files):
                 logger.info("No media found using cookies. Retrying WITHOUT cookies as fallback...")
                 try:
-                    last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=False, progress=progress, timeout=300)
+                    last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=False, progress=progress, timeout=90)
                 except Exception as e:
                     logger.warning(f"Fallback download without cookies failed: {e}")
                     last_stderr = str(e)
         else:
             logger.info(f"Attempting download without cookies (is_x={is_x})...")
             try:
-                last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=False, progress=progress, timeout=300)
+                last_stderr = run_ytdlp_download(url, download_path, is_carousel, is_x, use_cookies=False, progress=progress, timeout=90)
             except Exception as e:
                 logger.warning(f"Download without cookies failed: {e}")
                 last_stderr = str(e)
@@ -1502,6 +1559,9 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
     image_idx = 0
     total_urls = len(image_urls)
     for image_url in image_urls:
+        if status_msg_id in cancelled_downloads:
+            logger.info(f"Image download loop cancelled by user for msg_id={status_msg_id}")
+            break
         def _dl_progress(downloaded, total, _idx=image_idx, _total=total_urls):
             pct = int(downloaded * 100 / total) if total > 0 else 0
             mb_done = downloaded / (1024 * 1024)
@@ -1957,18 +2017,21 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
                     break
                 except TelegramError:
                     break
+                except Exception:
+                    break
             return False
 
     async def notify_stopped(reason: str):
         full_msg = f"🛑 توقف التحميل:\n{reason}"
-        await safe_edit(status_msg, full_msg)
-        try:
-            if update.message:
-                await update.message.reply_text(full_msg)
-            else:
-                await context.bot.send_message(chat_id=chat_id, text=full_msg)
-        except Exception as e:
-            logger.error(f"Failed to send stop notification reply: {e}")
+        edited = await safe_edit(status_msg, full_msg)
+        if not edited:
+            try:
+                if update.message:
+                    await update.message.reply_text(full_msg)
+                else:
+                    await context.bot.send_message(chat_id=chat_id, text=full_msg)
+            except Exception as e:
+                logger.error(f"Failed to send stop notification reply: {e}")
 
     try:
         async with _download_semaphore:
@@ -1988,7 +2051,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
             async def _poll_progress():
                 last = ""
                 while True:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(4)
                     elapsed = int(time.time() - start_t)
                     cur = progress.get("msg", "")
                     display = f"{cur} ({elapsed}ث)" if cur else f"⏳ جاري التحميل... ({elapsed}ث)"
@@ -2002,10 +2065,10 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
                     loop.run_in_executor(
                         None, extract_media, url, req_dir, chat_id, status_id, context.application, progress
                     ),
-                    timeout=600,
+                    timeout=210,
                 )
             except asyncio.TimeoutError:
-                await notify_stopped("استغرق التحميل وقتاً طويلاً (تجاوزت المهلة 10 دقائق) وتوقف.")
+                await notify_stopped("استغرق التحميل وقتاً أطول من المتوقع (تجاوزت المهلة 3.5 دقيقة) وتوقف لتجنب تعليق البوت.")
                 return
             finally:
                 poll_task.cancel()
@@ -2098,11 +2161,31 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
                     if p not in thumb_cache:
                         thumb_cache[p] = await loop.run_in_executor(None, extract_thumbnail, str(p))
 
-            await safe_edit(status_msg, f"⬆️ جاري إرسال {len(unique_items)} ملف...")
-            successful_sends, sent_group = await send_media_to_target(
-                context.bot, chat_id, unique_items, caption,
-                video_meta_cache, thumb_cache, loop
-            )
+            await safe_edit(status_msg, f"⬆️ جاري الرفع إلى تيليجرام ({len(unique_items)} ملف)... (0ث)")
+            upload_start_t = time.time()
+            uploading = True
+
+            async def _poll_upload():
+                while uploading:
+                    await asyncio.sleep(4)
+                    if not uploading:
+                        break
+                    elapsed = int(time.time() - upload_start_t)
+                    await safe_edit(status_msg, f"⬆️ جاري الرفع إلى تيليجرام ({len(unique_items)} ملف)... ({elapsed}ث)")
+
+            upload_task = asyncio.ensure_future(_poll_upload())
+            try:
+                successful_sends, sent_group = await send_media_to_target(
+                    context.bot, chat_id, unique_items, caption,
+                    video_meta_cache, thumb_cache, loop
+                )
+            finally:
+                uploading = False
+                upload_task.cancel()
+                try:
+                    await upload_task
+                except asyncio.CancelledError:
+                    pass
 
             if successful_sends > 0:
                 try:
