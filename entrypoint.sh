@@ -9,9 +9,9 @@ USE_LOCAL="false"
 
 if [ -n "${CLEAN_API_ID}" ] && [ -n "${CLEAN_API_HASH}" ]; then
     echo "[entrypoint] Checking telegram-bot-api binary..."
-    if /usr/local/bin/telegram-bot-api --version >/dev/null 2>&1; then
+    if /usr/local/bin/telegram-bot-api --version; then
         echo "[entrypoint] telegram-bot-api binary verified. Starting on port ${LOCAL_PORT}..."
-        telegram-bot-api \
+        /usr/local/bin/telegram-bot-api \
             --api-id="${CLEAN_API_ID}" \
             --api-hash="${CLEAN_API_HASH}" \
             --http-port="${LOCAL_PORT}" \
@@ -56,7 +56,7 @@ if [ "$USE_LOCAL" = "true" ]; then
     echo "[entrypoint] Starting bot with Local Bot API Server (2GB limit)..."
 else
     export USE_LOCAL_SERVER="false"
-    echo "[entrypoint] Starting bot with Telegram Cloud API (50MB limit + ffmpeg compression)..."
+    echo "[entrypoint] Starting bot with Telegram Cloud API (50MB limit + lossless video splitter fallback)..."
 fi
 
 exec python3 -u bot.py

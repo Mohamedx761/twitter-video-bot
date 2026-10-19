@@ -1,11 +1,14 @@
 FROM ghcr.io/jakbin/telegram-bot-api-binary:main AS server-src
 
-FROM python:3.12-slim-bookworm
+FROM ubuntu:24.04
 
 ENV PYTHONUNBUFFERED=1 \
     DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python-is-python3 \
     ffmpeg \
     curl \
     ca-certificates \
@@ -21,7 +24,7 @@ RUN mkdir -p /var/lib/telegram-bot-api /tmp/telegram-bot-api
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --break-system-packages --no-cache-dir -r requirements.txt
 
 COPY bot.py .
 COPY cookies.txt .

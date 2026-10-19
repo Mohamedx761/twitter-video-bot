@@ -55,7 +55,7 @@ AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0").strip().strip('"')
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads").strip().strip('"').strip("'"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip().strip('"').strip("'")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-BOT_VERSION = "v2.8-anti-freeze-and-live-upload-timer"
+BOT_VERSION = "v2.9-2gb-local-api-and-lossless-splitter"
 
 DB_PATH = Path("archive.db")
 
@@ -310,6 +310,71 @@ def compress_video(input_path: str, output_path: str, target_mb: float = 49.0) -
     except FileNotFoundError:
         logger.error("ffmpeg not found")
     return False
+
+
+def split_video(input_path: str, output_dir: Path | str, target_mb: float = 48.0) -> list[str]:
+    """Split video into segments under target_mb using ffmpeg stream copy (-c copy).
+    Stream copy is 100% LOSSLESS and near-instantaneous (2-3 seconds).
+    Returns list of paths to created segments."""
+    input_path = str(input_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not os.path.exists(input_path):
+        return []
+
+    size_bytes = os.path.getsize(input_path)
+    target_bytes = target_mb * 1024 * 1024
+    if size_bytes <= target_bytes:
+        return [input_path]
+
+    duration = get_video_duration(input_path)
+    if duration <= 0:
+        duration = max(30.0, size_bytes / (2 * 1024 * 1024))
+
+    # Calculate safe segment duration with 10% safety margin to account for keyframe placement
+    safe_target_bytes = target_bytes * 0.90
+    seg_time = (safe_target_bytes / size_bytes) * duration
+    seg_time = max(5.0, round(seg_time, 1))
+
+    stem = Path(input_path).stem
+    out_pattern = str(output_dir / f"{stem}_part_%03d.mp4")
+
+    logger.info(
+        f"[split_video] Splitting {Path(input_path).name} ({size_bytes/(1024*1024):.1f}MB, {duration:.1f}s) "
+        f"into ~{target_mb:.1f}MB chunks (segment_time={seg_time}s)"
+    )
+
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-c", "copy",
+        "-map", "0",
+        "-f", "segment",
+        "-segment_time", str(seg_time),
+        "-reset_timestamps", "1",
+        "-movflags", "+faststart",
+        out_pattern,
+    ]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if proc.returncode != 0:
+            logger.error(f"[split_video] ffmpeg segment failed: {proc.stderr[:400]}")
+            return []
+    except Exception as e:
+        logger.error(f"[split_video] Exception during split: {e}")
+        return []
+
+    # Collect and sort generated segments
+    prefix = f"{stem}_part_"
+    parts = sorted([
+        str(output_dir / f) for f in os.listdir(output_dir)
+        if f.startswith(prefix) and f.endswith(".mp4") and os.path.getsize(output_dir / f) > 1024
+    ])
+
+    logger.info(f"[split_video] Successfully created {len(parts)} parts for {Path(input_path).name}")
+    return parts
+
 
 def get_cookie_args() -> list:
     paths = [COOKIES_FILE, "cookies.txt"] if COOKIES_FILE else ["cookies.txt"]
@@ -571,14 +636,17 @@ async def _curl_upload_media_group(chat_id, media_items, caption="", timeout=600
         "-F", f"chat_id={chat_id}",
     ]
     media_json = []
-    for idx, (path, kind) in enumerate(media_items[:10]):
+    for idx, item_data in enumerate(media_items[:10]):
+        path = item_data[0]
+        kind = item_data[1]
+        item_cap = item_data[2] if len(item_data) > 2 else (caption if idx == 0 and caption else None)
         key = f"file_{idx}"
         item = {
             "type": "photo" if kind == "photo" else "video",
             "media": f"attach://{key}",
         }
-        if idx == 0 and caption:
-            item["caption"] = caption[:1024]
+        if item_cap:
+            item["caption"] = item_cap[:1024]
 
         if kind == "video":
             item["supports_streaming"] = True
@@ -673,12 +741,14 @@ async def send_media_group_isolated(bot, chat_id, media_list, caption="", thumb_
     file_handles = []
     try:
         grouped_media = []
-        for idx, (path, kind) in enumerate(media_list[:10]):
+        for idx, item_data in enumerate(media_list[:10]):
+            path = item_data[0]
+            kind = item_data[1]
             if not os.path.exists(path):
                 continue
+            item_caption = item_data[2] if len(item_data) > 2 else (caption if idx == 0 and caption else None)
             fh = open(path, "rb")
             file_handles.append(fh)
-            item_caption = caption if idx == 0 and caption else None
             if kind == "photo":
                 grouped_media.append(InputMediaPhoto(media=fh, caption=item_caption))
             elif kind == "video":
@@ -1821,14 +1891,19 @@ async def send_media_to_target(
             chunk = items[i:i + chunk_size]
             chunk_caption = caption if i == 0 else ""
             if len(chunk) == 1:
-                path, kind = chunk[0]
+                chunk_item = chunk[0]
+                path = chunk_item[0]
+                kind = chunk_item[1]
+                chunk_caption = chunk_item[2] if len(chunk_item) > 2 else (caption if i == 0 else "")
                 try:
                     if kind == "photo":
                         await _send_photo_isolated(target_chat_id, path, chunk_caption, timeout=120)
                     else:
                         meta = video_meta_cache.get(path)
                         thumb = thumb_cache.get(path)
-                        await _send_video_isolated(target_chat_id, path, chunk_caption, meta=meta, thumb_path=thumb, timeout=300)
+                        f_mb = os.path.getsize(path) / (1024 * 1024) if os.path.exists(path) else 0
+                        v_timeout = max(300, int((f_mb * 2) + 120))
+                        await _send_video_isolated(target_chat_id, path, chunk_caption, meta=meta, thumb_path=thumb, timeout=v_timeout)
                     successful_sends += 1
                 except Exception as e:
                     logger.warning(f"Single item send failed to {target_chat_id}: {e}")
@@ -1853,10 +1928,14 @@ async def send_media_to_target(
 
     # Fallback: send one by one if not sent as group
     if not sent_group:
-        for idx, (path, kind) in enumerate(items):
+        for idx, item_data in enumerate(items):
+            path = item_data[0]
+            kind = item_data[1]
             if not os.path.exists(path):
                 continue
-            item_caption = caption if idx == 0 else ""
+            item_caption = item_data[2] if len(item_data) > 2 else (caption if idx == 0 else "")
+            f_mb = os.path.getsize(path) / (1024 * 1024) if os.path.exists(path) else 0
+            v_timeout = max(300, int((f_mb * 2) + 120))
             for attempt in range(2):
                 try:
                     if kind == "photo":
@@ -1867,7 +1946,7 @@ async def send_media_to_target(
                         meta = video_meta_cache[path]
                         if path not in thumb_cache:
                             thumb_cache[path] = await loop.run_in_executor(None, extract_thumbnail, str(path))
-                        await _send_video_isolated(target_chat_id, path, item_caption, meta=meta, thumb_path=thumb_cache.get(path), timeout=300)
+                        await _send_video_isolated(target_chat_id, path, item_caption, meta=meta, thumb_path=thumb_cache.get(path), timeout=v_timeout)
                     successful_sends += 1
                     break
                 except Exception as e:
@@ -2117,36 +2196,62 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
                 file_mb = os.path.getsize(video_path) / (1024 * 1024)
 
                 if use_local:
-                    if file_mb > 2000:
-                        await notify_stopped(f"حجم الفيديو ({file_mb:.1f}MB) كبير جداً ويتجاوز الحد الأقصى لسيرفر تيليجرام (2000MB).")
-                        return
-                    await loop.run_in_executor(None, ensure_faststart, video_path)
-                    prepared_items.append((video_path, "video"))
-                else:
-                    if file_mb > 50:
-                        await safe_edit(status_msg, f"⏳ حجم الفيديو ({file_mb:.1f}MB) — جاري ضغطه ليناسب إرسال تيليجرام (أقل من 50MB)...")
-                        cpath = str(video_path) + ".compressed.mp4"
-                        try:
-                            compressed = await loop.run_in_executor(None, compress_video, video_path, cpath, 49.0)
-                            if compressed and os.path.exists(cpath) and os.path.getsize(cpath) <= 50 * 1024 * 1024:
-                                prepared_items.append((cpath, "video"))
-                            elif os.path.getsize(video_path) <= 50 * 1024 * 1024:
-                                prepared_items.append((video_path, "video"))
-                            else:
-                                await notify_stopped(f"تعذر ضغط الفيديو ({file_mb:.1f}MB) لحجم أقل من 50MB.")
-                                return
-                        except ValueError as ve:
-                            await notify_stopped(str(ve))
-                            return
-                    else:
+                    if file_mb <= 2000:
+                        await loop.run_in_executor(None, ensure_faststart, video_path)
                         prepared_items.append((video_path, "video"))
+                    else:
+                        await safe_edit(status_msg, f"✂️ حجم الفيديو ({file_mb:.1f}MB) يتجاوز 2GB — جاري تقسيمه بجودته الأصلية...")
+                        parts = await loop.run_in_executor(None, split_video, video_path, req_dir, 1950.0)
+                        if parts:
+                            if len(parts) > 1:
+                                for p_idx, p in enumerate(parts, 1):
+                                    p_cap = f"{caption}\n\n📦 جزء {p_idx} من {len(parts)}" if caption else f"📦 جزء {p_idx} من {len(parts)}"
+                                    prepared_items.append((p, "video", p_cap))
+                            else:
+                                prepared_items.append((parts[0], "video"))
+                        else:
+                            await notify_stopped(f"تعذر تقسيم الفيديو الكبير ({file_mb:.1f}MB).")
+                            return
+                else:
+                    if file_mb <= 50:
+                        prepared_items.append((video_path, "video"))
+                    else:
+                        duration = get_video_duration(video_path)
+                        can_compress = duration > 0 and duration < 600 and ((49 * 1024 * 1024 * 8) / duration) > 400_000
+
+                        compressed_ok = False
+                        if can_compress:
+                            await safe_edit(status_msg, f"⏳ حجم الفيديو ({file_mb:.1f}MB) — جاري ضغطه ليناسب إرسال تيليجرام (أقل من 50MB)...")
+                            cpath = str(video_path) + ".compressed.mp4"
+                            try:
+                                compressed = await loop.run_in_executor(None, compress_video, video_path, cpath, 49.0)
+                                if compressed and os.path.exists(cpath) and os.path.getsize(cpath) <= 50 * 1024 * 1024:
+                                    prepared_items.append((cpath, "video"))
+                                    compressed_ok = True
+                            except Exception as ce:
+                                logger.info(f"Compression skipped or failed ({ce}), will split losslessly...")
+
+                        if not compressed_ok:
+                            await safe_edit(status_msg, f"✂️ حجم الفيديو ({file_mb:.1f}MB) — جاري تقسيمه لأجزاء بجودته الأصلية 100% بدون أي ضغط...")
+                            parts = await loop.run_in_executor(None, split_video, video_path, req_dir, 47.0)
+                            if parts:
+                                if len(parts) > 1:
+                                    for p_idx, p in enumerate(parts, 1):
+                                        p_cap = f"{caption}\n\n📦 جزء {p_idx} من {len(parts)}" if caption else f"📦 جزء {p_idx} من {len(parts)}"
+                                        prepared_items.append((p, "video", p_cap))
+                                else:
+                                    prepared_items.append((parts[0], "video"))
+                            else:
+                                await notify_stopped(f"تعذر تجهيز الفيديو ({file_mb:.1f}MB) للإرسال.")
+                                return
 
             seen_paths = set()
             unique_items = []
-            for p, k in prepared_items:
+            for item_data in prepared_items:
+                p = item_data[0]
                 if p not in seen_paths and os.path.exists(p):
                     seen_paths.add(p)
-                    unique_items.append((p, k))
+                    unique_items.append(item_data)
 
             if not unique_items:
                 await notify_stopped("لم يتم العثور على أي ملفات صالحة للإرسال.")
@@ -2154,7 +2259,9 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
 
             video_meta_cache = {}
             thumb_cache = {}
-            for p, k in unique_items:
+            for item_data in unique_items:
+                p = item_data[0]
+                k = item_data[1]
                 if k == "video":
                     if p not in video_meta_cache:
                         video_meta_cache[p] = await loop.run_in_executor(None, get_video_metadata, str(p))
