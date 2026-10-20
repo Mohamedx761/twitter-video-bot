@@ -55,7 +55,7 @@ AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0").strip().strip('"')
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads").strip().strip('"').strip("'"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip().strip('"').strip("'")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-BOT_VERSION = "v3.1-instagram-profile-and-stories-downloader"
+BOT_VERSION = "v3.2-live-download-progress-and-counter-system"
 
 DB_PATH = Path("archive.db")
 
@@ -487,6 +487,57 @@ start_keyboard = ReplyKeyboardMarkup(
 
 VIDEO_EXTS = ('.mp4', '.mkv', '.webm', '.mov')
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.gif', '.webp')
+
+
+def make_progress_bar(current: int, total: int, length: int = 10) -> str:
+    """Generate visual progress bar [████░░░░░░] 40% from current and total counts."""
+    if total <= 0:
+        return f"[{'░' * length}] 0%"
+    fraction = min(1.0, max(0.0, current / total))
+    filled = int(round(fraction * length))
+    bar = "█" * filled + "░" * (length - filled)
+    pct = int(fraction * 100)
+    return f"[{bar}] {pct}%"
+
+
+def make_progress_bar_pct(pct: float, length: int = 10) -> str:
+    """Generate visual progress bar [██████░░░░] from a float percentage (0.0 - 100.0)."""
+    fraction = min(1.0, max(0.0, pct / 100.0))
+    filled = int(round(fraction * length))
+    bar = "█" * filled + "░" * (length - filled)
+    return f"[{bar}]"
+
+
+async def safe_edit_message(target, text: str, parse_mode: str = None, reply_markup=None) -> bool:
+    """Safely edit a message or callback query with retry handling, Markdown fallback, and ignoring 'not modified' errors."""
+    for _ in range(2):
+        try:
+            if hasattr(target, "edit_message_text"):
+                await target.edit_message_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+            elif hasattr(target, "edit_text"):
+                await target.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+            return True
+        except telegram.error.RetryAfter as ra:
+            await asyncio.sleep(ra.retry_after + 0.5)
+        except telegram.error.BadRequest as br:
+            err = str(br)
+            if "Message is not modified" in err:
+                return True
+            if "Can't parse entities" in err and parse_mode is not None:
+                # Markdown entity error fallback: retry without parse_mode
+                try:
+                    if hasattr(target, "edit_message_text"):
+                        await target.edit_message_text(text, parse_mode=None, reply_markup=reply_markup)
+                    elif hasattr(target, "edit_text"):
+                        await target.edit_text(text, parse_mode=None, reply_markup=reply_markup)
+                    return True
+                except Exception:
+                    pass
+            break
+        except Exception as e:
+            logger.debug(f"safe_edit_message error: {e}")
+            break
+    return False
 
 
 def _get_api_url():
@@ -1225,7 +1276,7 @@ def run_ytdlp_download(
         "--socket-timeout", "15",
         "--retries", "2",
         "--newline",
-        "--progress-template", "download:%(progress._percent_str)s of %(progress._total_bytes_str)s",
+        "--progress-template", "download:PROGRESS %(progress._percent_str)s | %(progress._downloaded_bytes_str)s/%(progress._total_bytes_str)s | %(progress._speed_str)s | ETA %(progress._eta_str)s",
     ]
     if use_cookies:
         cmd_dl += get_cookie_args()
@@ -1260,10 +1311,46 @@ def run_ytdlp_download(
             if not line:
                 break
             line_s = line.strip()
-            if line_s.startswith("download:"):
-                pct = line_s.replace("download:", "").strip()
-                if progress is not None and pct:
-                    progress["msg"] = f"⏳ جاري التحميل: {pct}"
+            if "PROGRESS" in line_s:
+                parts = line_s.replace("PROGRESS", "").strip().split("|")
+                pct_str = parts[0].strip() if len(parts) > 0 else ""
+                size_str = parts[1].strip() if len(parts) > 1 else ""
+                speed_str = parts[2].strip() if len(parts) > 2 else ""
+                eta_str = parts[3].strip() if len(parts) > 3 else ""
+
+                pct_val = 0.0
+                m = re.search(r"(\d+(?:\.\d+)?)%", pct_str)
+                if m:
+                    pct_val = float(m.group(1))
+                bar = make_progress_bar_pct(pct_val)
+
+                msg = f"⏳ **جاري تحميل الفيديو:**\n{bar} {pct_str}"
+                if size_str and "N/A" not in size_str:
+                    msg += f" ({size_str})"
+                if speed_str and "Unknown" not in speed_str:
+                    msg += f"\n⚡ السرعة: {speed_str}"
+                if eta_str and "Unknown" not in eta_str and "NA" not in eta_str:
+                    msg += f" • المتبقي: {eta_str.replace('ETA', '').strip()}"
+
+                if progress is not None:
+                    progress["msg"] = msg
+            elif line_s.startswith("[download]") and "%" in line_s:
+                m_pct = re.search(r"(\d+(?:\.\d+)?)%", line_s)
+                if m_pct:
+                    pct_val = float(m_pct.group(1))
+                    bar = make_progress_bar_pct(pct_val)
+                    m_size = re.search(r"of\s+(\S+)", line_s)
+                    m_spd = re.search(r"at\s+(\S+)", line_s)
+                    m_eta = re.search(r"ETA\s+(\S+)", line_s)
+                    msg = f"⏳ **جاري تحميل الفيديو:**\n{bar} {pct_val:.1f}%"
+                    if m_size:
+                        msg += f" ({m_size.group(1)})"
+                    if m_spd:
+                        msg += f"\n⚡ السرعة: {m_spd.group(1)}"
+                    if m_eta and "Unknown" not in m_eta.group(1):
+                        msg += f" • المتبقي: {m_eta.group(1)}"
+                    if progress is not None:
+                        progress["msg"] = msg
 
     def _read_stderr():
         for line in iter(proc.stderr.readline, ''):
@@ -1532,8 +1619,16 @@ def get_instaloader_instance():
         download_comments=False,
         save_metadata=False,
         compress_json=False,
-        request_timeout=20.0,
+        request_timeout=15.0,
+        max_connection_attempts=1,
     )
+    # Prevent Instaloader from sleeping 11 minutes (660s) on HTTP 429
+    def _fast_handle_429(query_type: str):
+        raise instaloader.exceptions.ConnectionException("HTTP error 429 - Too Many Requests (Login/Cookies required)")
+
+    if hasattr(L.context, "_rate_controller"):
+        L.context._rate_controller.handle_429 = _fast_handle_429
+
     cookie_paths = [COOKIES_FILE, "cookies.txt"] if COOKIES_FILE else ["cookies.txt"]
     for cp in cookie_paths:
         if cp and Path(cp).exists():
@@ -1630,7 +1725,8 @@ async def send_instagram_profile_menu(update: Update, context: ContextTypes.DEFA
 async def handle_instagram_profile_posts(query, context: ContextTypes.DEFAULT_TYPE, username: str, limit: int = 30):
     chat_id = query.message.chat_id
     loop = asyncio.get_running_loop()
-    await query.edit_message_text(f"⏳ جاري فحص بروفايل @{username} وجلب آخر {limit} منشور...")
+    start_time = time.time()
+    await safe_edit_message(query, f"⏳ جاري فحص بروفايل @{username} وجلب آخر {limit} منشور...")
 
     try:
         import instaloader
@@ -1640,21 +1736,19 @@ async def handle_instagram_profile_posts(query, context: ContextTypes.DEFAULT_TY
         err_str = str(e)
         logger.error(f"Failed to fetch profile {username}: {e}")
         if "429" in err_str or "login" in err_str.lower() or "redirect" in err_str.lower():
-            await query.edit_message_text(
+            await safe_edit_message(
+                query,
                 f"🛑 **تعذر الوصول لبروفايل @{username} بسبب قيود إنستجرام:**\n\n"
                 f"خوادم إنستجرام تتطلب تسجيل الدخول لتصفح البروفايلات الكاملة (`429 Too Many Requests`).\n\n"
-                f"🔑 **لحل المشكلة وتشغيل التحميل:**\n"
-                f"1. افتح متصفحك وسجل دخول بحساب إنستجرام (يُفضل حساب إضافي).\n"
-                f"2. استخدم إضافة مثل `Get cookies.txt LOCALLY` لتصدير ملف `cookies.txt`.\n"
-                f"3. ارفع الملف للسيرفر لتجاوز قيود إنستجرام فوراً.",
+                f"🔑 **الحل السهل والمباشر:**\n"
+                f"أرسل ملف `cookies.txt` الخاص بحسابك هنا في الشات مع البوت كملف عادي 📎\n"
+                f"سيقوم البوت بحفظه وتفعيل التحميل فوراً بدون أي قيود!",
                 parse_mode="Markdown"
             )
             return
         else:
-            await query.edit_message_text(f"🛑 تعذر العثور على الحساب @{username}: {e}")
+            await safe_edit_message(query, f"🛑 تعذر العثور على الحساب @{username}: {e}")
             return
-
-    await query.edit_message_text(f"⏳ تم العثور على @{username} ({profile.mediacount} منشور). جاري استخراج آخر {limit} منشور وتحميلهم...")
 
     def _get_posts():
         posts = []
@@ -1665,82 +1759,130 @@ async def handle_instagram_profile_posts(query, context: ContextTypes.DEFAULT_TY
         return posts
 
     try:
-        posts = await loop.run_in_executor(None, _get_posts)
+        posts = await asyncio.wait_for(loop.run_in_executor(None, _get_posts), timeout=45)
     except Exception as e:
+        err_str = str(e)
         logger.error(f"Error fetching posts for {username}: {e}")
-        await query.edit_message_text(f"🛑 تعذر جلب قائمة المنشورات: {e}")
+        if "429" in err_str or "login" in err_str.lower():
+            await safe_edit_message(
+                query,
+                f"🛑 **توقف جلب المنشورات:** إنستجرام يتطلب كوكيز مسجلة (`429 Too Many Requests`).\n\n"
+                f"يرجى إرسال ملف `cookies.txt` في الشات لتجاوز هذا القيد.",
+                parse_mode="Markdown"
+            )
+        else:
+            await safe_edit_message(query, f"🛑 تعذر جلب قائمة المنشورات: {e}")
         return
 
     if not posts:
-        await query.edit_message_text(f"لا توجد منشورات متاحة في حساب @{username}.")
+        await safe_edit_message(query, f"ℹ️ لا توجد منشورات متاحة في حساب @{username}.")
         return
 
     total = len(posts)
-    await query.edit_message_text(f"🚀 جاري تحميل وإرسال {total} منشور من حساب @{username}...")
-
     sent_count = 0
+    failed_count = 0
     req_dir = DOWNLOAD_DIR / f"ig_profile_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
     req_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         for idx, post in enumerate(posts, 1):
+            elapsed = int(time.time() - start_time)
+            bar = make_progress_bar(idx - 1, total, length=10)
+            status_text = (
+                f"📥 **جاري تحميل بروفايل @{username}:**\n"
+                f"{bar} ({idx - 1}/{total} تم إرساله)\n\n"
+                f"⏳ **جاري الآن معالجة المنشور {idx} من {total}...**\n"
+                f"✅ تم بنجاح: {sent_count} | ⏱️ الوقت: {elapsed}ث"
+            )
+            await safe_edit_message(query, status_text, parse_mode="Markdown")
+
             post_dir = req_dir / f"post_{idx:03d}"
             post_dir.mkdir(parents=True, exist_ok=True)
 
-            urls = []
-            if post.typename == "GraphSidecar":
-                for node in post.get_sidecar_nodes():
-                    if node.is_video and node.video_url:
-                        urls.append(node.video_url)
-                    elif node.display_url:
-                        urls.append(node.display_url)
-            elif post.is_video and post.video_url:
-                urls.append(post.video_url)
-            elif post.url:
-                urls.append(post.url)
+            try:
+                urls = []
+                if post.typename == "GraphSidecar":
+                    try:
+                        nodes = await loop.run_in_executor(None, lambda: list(post.get_sidecar_nodes()))
+                        for node in nodes:
+                            if node.is_video and node.video_url:
+                                urls.append(node.video_url)
+                            elif node.display_url:
+                                urls.append(node.display_url)
+                    except Exception as se:
+                        logger.warning(f"Could not get sidecar nodes for post {idx}: {se}")
+                        if post.url:
+                            urls.append(post.url)
+                elif post.is_video and post.video_url:
+                    urls.append(post.video_url)
+                elif post.url:
+                    urls.append(post.url)
 
-            if not urls:
-                continue
+                if not urls:
+                    logger.warning(f"No media URLs found for post {idx}")
+                    failed_count += 1
+                    shutil.rmtree(post_dir, ignore_errors=True)
+                    continue
 
-            post_files = []
-            for u_idx, media_url in enumerate(urls):
-                fp = await loop.run_in_executor(None, download_image_ytdlp, media_url, post_dir, u_idx)
-                if fp and os.path.exists(fp):
-                    fp = str(fix_media_file_extension(Path(fp)))
-                    post_files.append(fp)
+                post_files = []
+                for u_idx, media_url in enumerate(urls):
+                    fp = await loop.run_in_executor(None, download_image_ytdlp, media_url, post_dir, u_idx)
+                    if fp and os.path.exists(fp):
+                        fp = str(fix_media_file_extension(Path(fp)))
+                        post_files.append(fp)
 
-            if not post_files:
-                continue
+                if not post_files:
+                    logger.warning(f"Failed to download media files for post {idx}")
+                    failed_count += 1
+                    shutil.rmtree(post_dir, ignore_errors=True)
+                    continue
 
-            cap_text = post.caption or ""
-            post_caption = f"📸 منشور {idx} من {total} | @{username}\n\n{cap_text}"[:1000]
+                cap_text = post.caption or ""
+                post_caption = f"📸 منشور {idx} من {total} | @{username}\n\n{cap_text}"[:1000]
 
-            prepared_items = []
-            for pf in post_files:
-                k = "photo" if pf.lower().endswith(IMAGE_EXTS) else "video"
-                prepared_items.append((pf, k))
+                prepared_items = []
+                for pf in post_files:
+                    k = "photo" if pf.lower().endswith(IMAGE_EXTS) else "video"
+                    prepared_items.append((pf, k))
 
-            v_meta = {}
-            t_cache = {}
-            for p, k in prepared_items:
-                if k == "video":
-                    v_meta[p] = await loop.run_in_executor(None, get_video_metadata, str(p))
-                    t_cache[p] = await loop.run_in_executor(None, extract_thumbnail, str(p))
+                v_meta = {}
+                t_cache = {}
+                for p, k in prepared_items:
+                    if k == "video":
+                        v_meta[p] = await loop.run_in_executor(None, get_video_metadata, str(p))
+                        t_cache[p] = await loop.run_in_executor(None, extract_thumbnail, str(p))
 
-            sends, _ = await send_media_to_target(
-                context.bot, chat_id, prepared_items, post_caption,
-                v_meta, t_cache, loop
-            )
-            if sends > 0:
-                sent_count += 1
+                sends, _ = await send_media_to_target(
+                    context.bot, chat_id, prepared_items, post_caption,
+                    v_meta, t_cache, loop
+                )
+                if sends > 0:
+                    sent_count += 1
+                else:
+                    failed_count += 1
 
-            shutil.rmtree(post_dir, ignore_errors=True)
+            except Exception as pe:
+                logger.error(f"Error processing post {idx} for @{username}: {pe}")
+                failed_count += 1
+            finally:
+                shutil.rmtree(post_dir, ignore_errors=True)
+
             await asyncio.sleep(1.5)
 
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"✅ اكتملت العملية! تم بنجاح تحميل وإرسال {sent_count} من أصل {total} منشور من حساب @{username}."
+        final_bar = make_progress_bar(sent_count, total, length=10)
+        elapsed_total = int(time.time() - start_time)
+        res_text = (
+            f"✅ **اكتملت العملية بنجاح!**\n\n"
+            f"{final_bar} تم إرسال {sent_count} من أصل {total} منشور من حساب @{username}.\n"
+            f"⏱️ إجمالي الوقت المستغرق: {elapsed_total} ثانية."
         )
+        if failed_count > 0:
+            res_text += f"\n⚠️ (تعذر إرسال {failed_count} منشور بسبب قيود حقوق أو حذف من إنستجرام)."
+        await safe_edit_message(query, res_text, parse_mode="Markdown")
+
+    except Exception as ge:
+        logger.error(f"Unexpected error in handle_instagram_profile_posts: {ge}", exc_info=True)
+        await safe_edit_message(query, f"🛑 حدث خطأ أثناء معالجة البروفايل: {ge}")
     finally:
         shutil.rmtree(req_dir, ignore_errors=True)
 
@@ -1748,14 +1890,15 @@ async def handle_instagram_profile_posts(query, context: ContextTypes.DEFAULT_TY
 async def handle_instagram_stories(query, context: ContextTypes.DEFAULT_TYPE, username: str):
     chat_id = query.message.chat_id
     loop = asyncio.get_running_loop()
-    await query.edit_message_text(f"⏳ جاري فحص استوري @{username}...")
+    start_time = time.time()
+    await safe_edit_message(query, f"⏳ جاري فحص استوري @{username}...")
 
     try:
         import instaloader
         L = get_instaloader_instance()
         profile = await loop.run_in_executor(None, lambda: instaloader.Profile.from_username(L.context, username))
     except Exception as e:
-        await query.edit_message_text(f"🛑 تعذر الوصول للاستوري: يتطلب وجود كوكيز حساب إنستجرام في `cookies.txt` ({e}).", parse_mode="Markdown")
+        await safe_edit_message(query, f"🛑 تعذر الوصول للاستوري: يتطلب وجود كوكيز حساب إنستجرام في `cookies.txt` ({e}).", parse_mode="Markdown")
         return
 
     def _fetch_stories():
@@ -1766,44 +1909,71 @@ async def handle_instagram_stories(query, context: ContextTypes.DEFAULT_TYPE, us
         return items
 
     try:
-        story_items = await loop.run_in_executor(None, _fetch_stories)
+        story_items = await asyncio.wait_for(loop.run_in_executor(None, _fetch_stories), timeout=45)
     except Exception as e:
-        await query.edit_message_text(f"🛑 تعذر تحميل الاستوري: {e}\n(تأكد من وجود كوكيز حساب إنستجرام صالح في cookies.txt)")
+        await safe_edit_message(query, f"🛑 تعذر تحميل الاستوري: {e}\n(تأكد من وجود كوكيز حساب إنستجرام صالح في cookies.txt)")
         return
 
     if not story_items:
-        await query.edit_message_text(f"لا توجد استوري نشطة حالياً في حساب @{username}.")
+        await safe_edit_message(query, f"ℹ️ لا توجد استوري نشطة حالياً في حساب @{username}.")
         return
 
     total = len(story_items)
-    await query.edit_message_text(f"⭕ جاري تحميل وإرسال {total} استوري من حساب @{username}...")
-
     req_dir = DOWNLOAD_DIR / f"ig_stories_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
     req_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         sent_count = 0
+        failed_count = 0
         for idx, item in enumerate(story_items, 1):
-            u = item.video_url if item.is_video else item.url
-            if not u:
-                continue
-            fp = await loop.run_in_executor(None, download_image_ytdlp, u, req_dir, idx)
-            if fp and os.path.exists(fp):
-                fp = str(fix_media_file_extension(Path(fp)))
-                kind = "video" if item.is_video else "photo"
-                caption = f"⭕ استوري {idx} من {total} | @{username}"
-                v_meta = {fp: await loop.run_in_executor(None, get_video_metadata, str(fp))} if kind == "video" else {}
-                t_cache = {fp: await loop.run_in_executor(None, extract_thumbnail, str(fp))} if kind == "video" else {}
-                s, _ = await send_media_to_target(context.bot, chat_id, [(fp, kind)], caption, v_meta, t_cache, loop)
-                if s > 0:
-                    sent_count += 1
-                try:
-                    os.remove(fp)
-                except Exception:
-                    pass
-                await asyncio.sleep(1.0)
+            elapsed = int(time.time() - start_time)
+            bar = make_progress_bar(idx - 1, total, length=10)
+            status_text = (
+                f"⭕ **جاري تحميل استوري @{username}:**\n"
+                f"{bar} ({idx - 1}/{total} تم إرساله)\n\n"
+                f"⏳ **جاري الآن معالجة الاستوري {idx} من {total}...**\n"
+                f"✅ تم بنجاح: {sent_count} | ⏱️ الوقت: {elapsed}ث"
+            )
+            await safe_edit_message(query, status_text, parse_mode="Markdown")
 
-        await context.bot.send_message(chat_id=chat_id, text=f"✅ تم بنجاح إرسال {sent_count} استوري من حساب @{username}!")
+            try:
+                u = item.video_url if item.is_video else item.url
+                if not u:
+                    failed_count += 1
+                    continue
+                fp = await loop.run_in_executor(None, download_image_ytdlp, u, req_dir, idx)
+                if fp and os.path.exists(fp):
+                    fp = str(fix_media_file_extension(Path(fp)))
+                    kind = "video" if item.is_video else "photo"
+                    caption = f"⭕ استوري {idx} من {total} | @{username}"
+                    v_meta = {fp: await loop.run_in_executor(None, get_video_metadata, str(fp))} if kind == "video" else {}
+                    t_cache = {fp: await loop.run_in_executor(None, extract_thumbnail, str(fp))} if kind == "video" else {}
+                    s, _ = await send_media_to_target(context.bot, chat_id, [(fp, kind)], caption, v_meta, t_cache, loop)
+                    if s > 0:
+                        sent_count += 1
+                    else:
+                        failed_count += 1
+                    try:
+                        os.remove(fp)
+                    except Exception:
+                        pass
+                else:
+                    failed_count += 1
+            except Exception as se:
+                logger.warning(f"Error sending story {idx} for {username}: {se}")
+                failed_count += 1
+            await asyncio.sleep(1.0)
+
+        final_bar = make_progress_bar(sent_count, total, length=10)
+        elapsed_total = int(time.time() - start_time)
+        res_text = (
+            f"✅ **اكتمل تحميل الاستوري بنجاح!**\n\n"
+            f"{final_bar} تم إرسال {sent_count} من أصل {total} استوري من @{username}.\n"
+            f"⏱️ الوقت المستغرق: {elapsed_total}ث"
+        )
+        if failed_count > 0:
+            res_text += f"\n⚠️ (تعذر إرسال {failed_count} استوري)."
+        await safe_edit_message(query, res_text, parse_mode="Markdown")
     finally:
         shutil.rmtree(req_dir, ignore_errors=True)
 
@@ -1811,14 +1981,15 @@ async def handle_instagram_stories(query, context: ContextTypes.DEFAULT_TYPE, us
 async def handle_instagram_highlights(query, context: ContextTypes.DEFAULT_TYPE, username: str):
     chat_id = query.message.chat_id
     loop = asyncio.get_running_loop()
-    await query.edit_message_text(f"⏳ جاري فحص هايلايتس @{username}...")
+    start_time = time.time()
+    await safe_edit_message(query, f"⏳ جاري فحص هايلايتس @{username}...")
 
     try:
         import instaloader
         L = get_instaloader_instance()
         profile = await loop.run_in_executor(None, lambda: instaloader.Profile.from_username(L.context, username))
     except Exception as e:
-        await query.edit_message_text(f"🛑 تعذر الوصول للهايلايتس: يتطلب وجود كوكيز حساب إنستجرام في `cookies.txt` ({e}).", parse_mode="Markdown")
+        await safe_edit_message(query, f"🛑 تعذر الوصول للهايلايتس: يتطلب وجود كوكيز حساب إنستجرام في `cookies.txt` ({e}).", parse_mode="Markdown")
         return
 
     def _fetch_highlights():
@@ -1833,44 +2004,71 @@ async def handle_instagram_highlights(query, context: ContextTypes.DEFAULT_TYPE,
         return hl_list
 
     try:
-        hl_items = await loop.run_in_executor(None, _fetch_highlights)
+        hl_items = await asyncio.wait_for(loop.run_in_executor(None, _fetch_highlights), timeout=45)
     except Exception as e:
-        await query.edit_message_text(f"🛑 تعذر تحميل الهايلايتس: {e}\n(تأكد من وجود كوكيز حساب إنستجرام صالح في cookies.txt)")
+        await safe_edit_message(query, f"🛑 تعذر تحميل الهايلايتس: {e}\n(تأكد من وجود كوكيز حساب إنستجرام صالح في cookies.txt)")
         return
 
     if not hl_items:
-        await query.edit_message_text(f"لا توجد هايلايتس متاحة في حساب @{username}.")
+        await safe_edit_message(query, f"ℹ️ لا توجد هايلايتس متاحة في حساب @{username}.")
         return
 
     total = len(hl_items)
-    await query.edit_message_text(f"⭐ جاري تحميل وإرسال {total} عنصر من هايلايتس @{username}...")
-
     req_dir = DOWNLOAD_DIR / f"ig_hl_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
     req_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         sent_count = 0
+        failed_count = 0
         for idx, (hl_title, item) in enumerate(hl_items, 1):
-            u = item.video_url if item.is_video else item.url
-            if not u:
-                continue
-            fp = await loop.run_in_executor(None, download_image_ytdlp, u, req_dir, idx)
-            if fp and os.path.exists(fp):
-                fp = str(fix_media_file_extension(Path(fp)))
-                kind = "video" if item.is_video else "photo"
-                caption = f"⭐ هايلايت: {hl_title} ({idx}/{total}) | @{username}"
-                v_meta = {fp: await loop.run_in_executor(None, get_video_metadata, str(fp))} if kind == "video" else {}
-                t_cache = {fp: await loop.run_in_executor(None, extract_thumbnail, str(fp))} if kind == "video" else {}
-                s, _ = await send_media_to_target(context.bot, chat_id, [(fp, kind)], caption, v_meta, t_cache, loop)
-                if s > 0:
-                    sent_count += 1
-                try:
-                    os.remove(fp)
-                except Exception:
-                    pass
-                await asyncio.sleep(1.0)
+            elapsed = int(time.time() - start_time)
+            bar = make_progress_bar(idx - 1, total, length=10)
+            status_text = (
+                f"⭐ **جاري تحميل هايلايتس @{username}:**\n"
+                f"{bar} ({idx - 1}/{total} تم إرساله)\n\n"
+                f"⏳ **جاري الآن معالجة: {hl_title} ({idx} من {total})...**\n"
+                f"✅ تم بنجاح: {sent_count} | ⏱️ الوقت: {elapsed}ث"
+            )
+            await safe_edit_message(query, status_text, parse_mode="Markdown")
 
-        await context.bot.send_message(chat_id=chat_id, text=f"✅ تم بنجاح إرسال {sent_count} عنصر من هايلايتس @{username}!")
+            try:
+                u = item.video_url if item.is_video else item.url
+                if not u:
+                    failed_count += 1
+                    continue
+                fp = await loop.run_in_executor(None, download_image_ytdlp, u, req_dir, idx)
+                if fp and os.path.exists(fp):
+                    fp = str(fix_media_file_extension(Path(fp)))
+                    kind = "video" if item.is_video else "photo"
+                    caption = f"⭐ هايلايت: {hl_title} ({idx}/{total}) | @{username}"
+                    v_meta = {fp: await loop.run_in_executor(None, get_video_metadata, str(fp))} if kind == "video" else {}
+                    t_cache = {fp: await loop.run_in_executor(None, extract_thumbnail, str(fp))} if kind == "video" else {}
+                    s, _ = await send_media_to_target(context.bot, chat_id, [(fp, kind)], caption, v_meta, t_cache, loop)
+                    if s > 0:
+                        sent_count += 1
+                    else:
+                        failed_count += 1
+                    try:
+                        os.remove(fp)
+                    except Exception:
+                        pass
+                else:
+                    failed_count += 1
+            except Exception as he:
+                logger.warning(f"Error sending highlight item {idx} for {username}: {he}")
+                failed_count += 1
+            await asyncio.sleep(1.0)
+
+        final_bar = make_progress_bar(sent_count, total, length=10)
+        elapsed_total = int(time.time() - start_time)
+        res_text = (
+            f"✅ **اكتمل تحميل الهايلايتس بنجاح!**\n\n"
+            f"{final_bar} تم إرسال {sent_count} من أصل {total} عنصر من هايلايتس @{username}.\n"
+            f"⏱️ الوقت المستغرق: {elapsed_total}ث"
+        )
+        if failed_count > 0:
+            res_text += f"\n⚠️ (تعذر إرسال {failed_count} عنصر)."
+        await safe_edit_message(query, res_text, parse_mode="Markdown")
     finally:
         shutil.rmtree(req_dir, ignore_errors=True)
 
@@ -2065,8 +2263,9 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
             pct = int(downloaded * 100 / total) if total > 0 else 0
             mb_done = downloaded / (1024 * 1024)
             mb_total = total / (1024 * 1024)
+            bar = make_progress_bar(downloaded, total, length=10)
             if progress is not None:
-                progress["msg"] = f"⬇️ تحميل {_idx+1}/{_total}: {pct}% ({mb_done:.1f}/{mb_total:.1f}MB)"
+                progress["msg"] = f"⬇️ **تحميل ملف {_idx+1}/{_total}:**\n{bar} ({mb_done:.1f}/{mb_total:.1f}MB)"
         fp = download_image_ytdlp(image_url, download_path, image_idx, progress_cb=_dl_progress)
         image_idx += 1
         if fp:
@@ -2529,21 +2728,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
 
     async def safe_edit(msg, text):
         async with _edit_lock:
-            for _ in range(2):
-                try:
-                    await msg.edit_text(text)
-                    return True
-                except telegram.error.RetryAfter as ra:
-                    await asyncio.sleep(ra.retry_after + 0.5)
-                except telegram.error.BadRequest as br:
-                    if "Message is not modified" in str(br):
-                        return True
-                    break
-                except TelegramError:
-                    break
-                except Exception:
-                    break
-            return False
+            return await safe_edit_message(msg, text, parse_mode="Markdown")
 
     async def notify_stopped(reason: str):
         full_msg = f"🛑 توقف التحميل:\n{reason}"
@@ -2575,10 +2760,10 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
             async def _poll_progress():
                 last = ""
                 while True:
-                    await asyncio.sleep(4)
+                    await asyncio.sleep(2.5)
                     elapsed = int(time.time() - start_t)
                     cur = progress.get("msg", "")
-                    display = f"{cur} ({elapsed}ث)" if cur else f"⏳ جاري التحميل... ({elapsed}ث)"
+                    display = f"{cur}\n⏱️ الوقت: {elapsed}ث" if cur else f"⏳ جاري فحص الرابط وبدء التحميل... ({elapsed}ث)"
                     if display != last:
                         last = display
                         await safe_edit(status_msg, display)
@@ -2720,7 +2905,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
 
             async def _poll_upload():
                 while uploading:
-                    await asyncio.sleep(4)
+                    await asyncio.sleep(2.5)
                     if not uploading:
                         break
                     elapsed = int(time.time() - upload_start_t)
