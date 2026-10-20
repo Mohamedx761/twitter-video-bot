@@ -1735,14 +1735,17 @@ async def handle_instagram_profile_posts(query, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         err_str = str(e)
         logger.error(f"Failed to fetch profile {username}: {e}")
-        if "429" in err_str or "login" in err_str.lower() or "redirect" in err_str.lower():
+        is_auth_barrier = any(w in err_str.lower() for w in ["429", "302", "401", "403", "login", "redirect", "checkpoint", "two-factor", "cookie", "found when accessing"])
+        if is_auth_barrier:
             await safe_edit_message(
                 query,
-                f"🛑 **تعذر الوصول لبروفايل @{username} بسبب قيود إنستجرام:**\n\n"
-                f"خوادم إنستجرام تتطلب تسجيل الدخول لتصفح البروفايلات الكاملة (`429 Too Many Requests`).\n\n"
-                f"🔑 **الحل السهل والمباشر:**\n"
-                f"أرسل ملف `cookies.txt` الخاص بحسابك هنا في الشات مع البوت كملف عادي 📎\n"
-                f"سيقوم البوت بحفظه وتفعيل التحميل فوراً بدون أي قيود!",
+                f"🛑 **يتطلب إنستجرام تسجيل الدخول لتصفح بروفايل @{username}:**\n\n"
+                f"خوادم إنستجرام تمنع تصفح البروفايلات بدون حساب وتقوم بالتحويل لصفحة تسجيل الدخول (`302 Redirect`).\n\n"
+                f"🔑 **طريقة تشغيل التحميل بسهولة في دقيقة:**\n"
+                f"1️⃣ افتح Instagram على متصفحك وسجل دخول لحسابك.\n"
+                f"2️⃣ استخرج ملف الكوكيز `cookies.txt` (باستخدام إضافة متصفح مثل *Get cookies.txt LOCALLY*).\n"
+                f"3️⃣ أرسل ملف `cookies.txt` هنا في شات البوت كملف عادي 📎.\n\n"
+                f"⚡ سيتعرف عليه البوت تلقائياً ويعمل معك تحميل البروفايلات والاستوري والهايلايتس فوراً بدون أي حظر!",
                 parse_mode="Markdown"
             )
             return
@@ -1763,11 +1766,12 @@ async def handle_instagram_profile_posts(query, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         err_str = str(e)
         logger.error(f"Error fetching posts for {username}: {e}")
-        if "429" in err_str or "login" in err_str.lower():
+        is_auth_barrier = any(w in err_str.lower() for w in ["429", "302", "401", "403", "login", "redirect", "checkpoint", "two-factor", "cookie", "found when accessing"])
+        if is_auth_barrier:
             await safe_edit_message(
                 query,
-                f"🛑 **توقف جلب المنشورات:** إنستجرام يتطلب كوكيز مسجلة (`429 Too Many Requests`).\n\n"
-                f"يرجى إرسال ملف `cookies.txt` في الشات لتجاوز هذا القيد.",
+                f"🛑 **توقف جلب المنشورات:** يتطلب إنستجرام ملف كوكيز مسجل (`cookies.txt`).\n\n"
+                f"أرسل ملف `cookies.txt` هنا في الشات لتفعيل تصفح المنشورات فوراً.",
                 parse_mode="Markdown"
             )
         else:
@@ -1898,7 +1902,19 @@ async def handle_instagram_stories(query, context: ContextTypes.DEFAULT_TYPE, us
         L = get_instaloader_instance()
         profile = await loop.run_in_executor(None, lambda: instaloader.Profile.from_username(L.context, username))
     except Exception as e:
-        await safe_edit_message(query, f"🛑 تعذر الوصول للاستوري: يتطلب وجود كوكيز حساب إنستجرام في `cookies.txt` ({e}).", parse_mode="Markdown")
+        err_str = str(e)
+        logger.error(f"Failed to fetch profile for stories {username}: {e}")
+        is_auth_barrier = any(w in err_str.lower() for w in ["429", "302", "401", "403", "login", "redirect", "checkpoint", "two-factor", "cookie", "found when accessing"])
+        if is_auth_barrier:
+            await safe_edit_message(
+                query,
+                f"🛑 **يتطلب تحميل الاستوري تسجيل الدخول لحسابك:**\n\n"
+                f"إنستجرام يشترط وجود جلسة مسجلة لمشاهدة الاستوري.\n"
+                f"يرجى إرسال ملف `cookies.txt` هنا في الشات مع البوت كملف 📎 لتفعيل تحميل الاستوري فوراً.",
+                parse_mode="Markdown"
+            )
+        else:
+            await safe_edit_message(query, f"🛑 تعذر الوصول للاستوري: {e}")
         return
 
     def _fetch_stories():
@@ -1911,7 +1927,7 @@ async def handle_instagram_stories(query, context: ContextTypes.DEFAULT_TYPE, us
     try:
         story_items = await asyncio.wait_for(loop.run_in_executor(None, _fetch_stories), timeout=45)
     except Exception as e:
-        await safe_edit_message(query, f"🛑 تعذر تحميل الاستوري: {e}\n(تأكد من وجود كوكيز حساب إنستجرام صالح في cookies.txt)")
+        await safe_edit_message(query, f"🛑 تعذر تحميل الاستوري: يتطلب وجود كوكيز حساب إنستجرام صالح في `cookies.txt` ({e}).", parse_mode="Markdown")
         return
 
     if not story_items:
@@ -1989,7 +2005,19 @@ async def handle_instagram_highlights(query, context: ContextTypes.DEFAULT_TYPE,
         L = get_instaloader_instance()
         profile = await loop.run_in_executor(None, lambda: instaloader.Profile.from_username(L.context, username))
     except Exception as e:
-        await safe_edit_message(query, f"🛑 تعذر الوصول للهايلايتس: يتطلب وجود كوكيز حساب إنستجرام في `cookies.txt` ({e}).", parse_mode="Markdown")
+        err_str = str(e)
+        logger.error(f"Failed to fetch profile for highlights {username}: {e}")
+        is_auth_barrier = any(w in err_str.lower() for w in ["429", "302", "401", "403", "login", "redirect", "checkpoint", "two-factor", "cookie", "found when accessing"])
+        if is_auth_barrier:
+            await safe_edit_message(
+                query,
+                f"🛑 **يتطلب تحميل الهايلايتس تسجيل الدخول لحسابك:**\n\n"
+                f"إنستجرام يشترط وجود جلسة مسجلة لمشاهدة الهايلايتس.\n"
+                f"يرجى إرسال ملف `cookies.txt` هنا في الشات مع البوت كملف 📎 لتفعيل تحميل الهايلايتس فوراً.",
+                parse_mode="Markdown"
+            )
+        else:
+            await safe_edit_message(query, f"🛑 تعذر الوصول للهايلايتس: {e}")
         return
 
     def _fetch_highlights():
@@ -2006,7 +2034,7 @@ async def handle_instagram_highlights(query, context: ContextTypes.DEFAULT_TYPE,
     try:
         hl_items = await asyncio.wait_for(loop.run_in_executor(None, _fetch_highlights), timeout=45)
     except Exception as e:
-        await safe_edit_message(query, f"🛑 تعذر تحميل الهايلايتس: {e}\n(تأكد من وجود كوكيز حساب إنستجرام صالح في cookies.txt)")
+        await safe_edit_message(query, f"🛑 تعذر تحميل الهايلايتس: يتطلب وجود كوكيز حساب إنستجرام صالح في `cookies.txt` ({e}).", parse_mode="Markdown")
         return
 
     if not hl_items:
