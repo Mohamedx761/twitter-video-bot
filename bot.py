@@ -1773,16 +1773,53 @@ async def handle_instagram_profile_posts(query, context: ContextTypes.DEFAULT_TY
             await safe_edit_message(query, f"🛑 تعذر العثور على الحساب @{username}: {e}")
             return
 
+    if getattr(profile, "is_private", False) and not getattr(profile, "followed_by_viewer", True):
+        await safe_edit_message(
+            query,
+            f"🔒 **حساب إنستجرام خاص (Private):**\n\n"
+            f"الحساب `@{username}` مقفل ولا يمكن تصفح منشوراته إلا إذا كان حسابك المسجل يتابعه بالفعل.",
+            parse_mode="Markdown"
+        )
+        return
+
     def _get_posts():
         posts = []
-        for p in profile.get_posts():
-            posts.append(p)
-            if len(posts) >= limit:
-                break
+        # Attempt 1: Try profile.get_posts()
+        try:
+            for p in profile.get_posts():
+                posts.append(p)
+                if len(posts) >= limit:
+                    break
+        except Exception as ge:
+            logger.warning(f"profile.get_posts() error for {username}: {ge}. Trying web page data fallback...")
+
+        # Fallback: Extract directly from profile web page data if GraphQL failed (e.g. 502 Bad Gateway)
+        if not posts:
+            try:
+                page = L.context.get_page_data(f"{username.lower()}/")
+                for item in page:
+                    if "xig_user_by_username" in item:
+                        u = item["xig_user_by_username"]
+                        conn = u.get("polaris_ordered_timeline_connection") or u.get("edge_owner_to_timeline_media")
+                        if conn:
+                            for edge in conn.get("edges", []):
+                                node = edge.get("node", {})
+                                code = node.get("code") or node.get("shortcode")
+                                if code:
+                                    try:
+                                        p_obj = instaloader.Post.from_shortcode(L.context, code)
+                                        posts.append(p_obj)
+                                        if len(posts) >= limit:
+                                            break
+                                    except Exception as se:
+                                        logger.warning(f"Error fetching post {code}: {se}")
+            except Exception as pe:
+                logger.error(f"Fallback page data extraction failed for {username}: {pe}")
+
         return posts
 
     try:
-        posts = await asyncio.wait_for(loop.run_in_executor(None, _get_posts), timeout=45)
+        posts = await asyncio.wait_for(loop.run_in_executor(None, _get_posts), timeout=60)
     except Exception as e:
         err_str = str(e)
         logger.error(f"Error fetching posts for {username}: {e}")
@@ -1792,6 +1829,14 @@ async def handle_instagram_profile_posts(query, context: ContextTypes.DEFAULT_TY
                 query,
                 f"🛑 **توقف جلب المنشورات:** يتطلب إنستجرام ملف كوكيز مسجل (`cookies.txt`).\n\n"
                 f"أرسل ملف `cookies.txt` هنا في الشات لتفعيل تصفح المنشورات فوراً.",
+                parse_mode="Markdown"
+            )
+        elif "502" in err_str or "503" in err_str or "504" in err_str:
+            await safe_edit_message(
+                query,
+                f"⚠️ **استجابة بطيئة من خوادم إنستجرام (502 Bad Gateway):**\n\n"
+                f"خوادم إنستجرام تشهد ضغطاً مؤقتاً في الرد على طلبات المنشورات.\n"
+                f"👉 اضغط على زر التحميل مرة أخرى الآن بعد لحظات وسيتم التحميل بنجاح.",
                 parse_mode="Markdown"
             )
         else:
