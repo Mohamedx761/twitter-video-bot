@@ -55,7 +55,7 @@ AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0").strip().strip('"')
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads").strip().strip('"').strip("'"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip().strip('"').strip("'")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-BOT_VERSION = "v3.0-tiktok-photo-fix-and-instagram-album-support"
+BOT_VERSION = "v3.1-instagram-profile-and-stories-downloader"
 
 DB_PATH = Path("archive.db")
 
@@ -436,8 +436,9 @@ def is_authorized(user_id: int) -> bool:
 URL_PATTERNS = [
     # X / Twitter
     r"(?:https?://)?(?:www\.)?(?:x|twitter)\.com/[^\s/]+/status/\d+\S*",
-    # Instagram
+    # Instagram (Posts, Reels, TV, Stories, and Profiles)
     r"(?:https?://)?(?:www\.)?instagram\.com/(?:p|reel|reels|tv|stories)/[A-Za-z0-9_-]+\S*",
+    r"(?:https?://)?(?:www\.)?instagram\.com/[A-Za-z0-9_\.]+/?(?:\?[^\s]*)?",
     # TikTok (all post, album, and shortlink formats)
     r"(?:https?://)?(?:www\.|m\.|lite\.)?tiktok\.com/@[\w\.-]+/(?:video|photo)/\d+\S*",
     r"(?:https?://)?(?:www\.|m\.|lite\.)?tiktok\.com/t/[A-Za-z0-9_-]+\S*",
@@ -460,7 +461,7 @@ def extract_url(text: str) -> str:
     text = text.strip()
     promo_patterns = [
         r"tiktok\.com/(?:tiktoklite|download|app|about|legal|privacy)(?:/|\?|$)",
-        r"instagram\.com/(?:about|legal|download)(?:/|\?|$)",
+        r"instagram\.com/(?:about|legal|download|explore|accounts|developer|directory)(?:/|\?|$)",
         r"(?:x|twitter)\.com/(?:download|about)(?:/|\?|$)",
     ]
 
@@ -1520,30 +1521,62 @@ def get_tiktok_media(url: str) -> tuple[dict, list]:
     return {}, []
 
 
+def get_instaloader_instance():
+    """Creates Instaloader instance with cookies loaded from cookies.txt if available."""
+    import instaloader
+    L = instaloader.Instaloader(
+        download_pictures=False,
+        download_videos=False,
+        download_video_thumbnails=False,
+        download_geotags=False,
+        download_comments=False,
+        save_metadata=False,
+        compress_json=False,
+        request_timeout=20.0,
+    )
+    cookie_paths = [COOKIES_FILE, "cookies.txt"] if COOKIES_FILE else ["cookies.txt"]
+    for cp in cookie_paths:
+        if cp and Path(cp).exists():
+            try:
+                import http.cookiejar
+                cj = http.cookiejar.MozillaCookieJar(cp)
+                cj.load(ignore_discard=True, ignore_expires=True)
+                L.context._session.cookies = cj
+                logger.info(f"Loaded cookies from {cp} into Instaloader session")
+                break
+            except Exception as ce:
+                logger.warning(f"Could not load cookies from {cp} into Instaloader: {ce}")
+    return L
+
+
 def extract_instagram_shortcode(url: str) -> str:
     m = re.search(r"instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)", url, re.I)
     return m.group(1) if m else None
 
 
+def is_instagram_profile_url(url: str) -> str | None:
+    """If url is an Instagram profile link, return the username. Otherwise None."""
+    clean = url.strip()
+    m = re.search(r"(?:https?://)?(?:www\.)?instagram\.com/([A-Za-z0-9_\.]+)/?(?:\?[^\s]*)?$", clean, re.I)
+    if not m:
+        return None
+    username = m.group(1).lower()
+    system_names = {"p", "reel", "reels", "tv", "stories", "explore", "accounts", "about", "legal", "download", "direct", "developer"}
+    if username in system_names:
+        return None
+    return username
+
+
 def get_instagram_media(url: str) -> tuple[dict, list]:
     """Fetch direct photo, video, or carousel album URLs from Instagram using Instaloader.
-    Handles single photos, multi-photo/video carousels, and reels seamlessly without login."""
+    Handles single photos, multi-photo/video carousels, and reels seamlessly."""
     shortcode = extract_instagram_shortcode(url)
     if not shortcode:
         return {}, []
 
     try:
         import instaloader
-        L = instaloader.Instaloader(
-            download_pictures=False,
-            download_videos=False,
-            download_video_thumbnails=False,
-            download_geotags=False,
-            download_comments=False,
-            save_metadata=False,
-            compress_json=False,
-            request_timeout=15.0,
-        )
+        L = get_instaloader_instance()
         post = instaloader.Post.from_shortcode(L.context, shortcode)
         info = {
             "title": post.caption or "",
@@ -1568,6 +1601,278 @@ def get_instagram_media(url: str) -> tuple[dict, list]:
     except Exception as e:
         logger.warning(f"Instaloader attempt failed for Instagram post {shortcode}: {e}")
         return {}, []
+
+
+async def send_instagram_profile_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, username: str):
+    keyboard = [
+        [
+            InlineKeyboardButton("📸 تحميل آخر 30 منشور (كل منشور لوحده)", callback_data=f"ig_posts_{username}"),
+        ],
+        [
+            InlineKeyboardButton("⭕ تحميل الاستوري (Stories)", callback_data=f"ig_stories_{username}"),
+            InlineKeyboardButton("⭐ الهايلايتس (Highlights)", callback_data=f"ig_hl_{username}"),
+        ],
+        [
+            InlineKeyboardButton("❌ إلغاء", callback_data="cancel_download"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    text = (
+        f"👤 **بروفايل إنستجرام:** `@{username}`\n\n"
+        f"اختر ما تريد تحميله من الحساب:"
+    )
+    if update.message:
+        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
+
+async def handle_instagram_profile_posts(query, context: ContextTypes.DEFAULT_TYPE, username: str, limit: int = 30):
+    chat_id = query.message.chat_id
+    loop = asyncio.get_running_loop()
+    await query.edit_message_text(f"⏳ جاري فحص بروفايل @{username} وجلب آخر {limit} منشور...")
+
+    try:
+        import instaloader
+        L = get_instaloader_instance()
+        profile = await loop.run_in_executor(None, lambda: instaloader.Profile.from_username(L.context, username))
+    except Exception as e:
+        err_str = str(e)
+        logger.error(f"Failed to fetch profile {username}: {e}")
+        if "429" in err_str or "login" in err_str.lower() or "redirect" in err_str.lower():
+            await query.edit_message_text(
+                f"🛑 **تعذر الوصول لبروفايل @{username} بسبب قيود إنستجرام:**\n\n"
+                f"خوادم إنستجرام تتطلب تسجيل الدخول لتصفح البروفايلات الكاملة (`429 Too Many Requests`).\n\n"
+                f"🔑 **لحل المشكلة وتشغيل التحميل:**\n"
+                f"1. افتح متصفحك وسجل دخول بحساب إنستجرام (يُفضل حساب إضافي).\n"
+                f"2. استخدم إضافة مثل `Get cookies.txt LOCALLY` لتصدير ملف `cookies.txt`.\n"
+                f"3. ارفع الملف للسيرفر لتجاوز قيود إنستجرام فوراً.",
+                parse_mode="Markdown"
+            )
+            return
+        else:
+            await query.edit_message_text(f"🛑 تعذر العثور على الحساب @{username}: {e}")
+            return
+
+    await query.edit_message_text(f"⏳ تم العثور على @{username} ({profile.mediacount} منشور). جاري استخراج آخر {limit} منشور وتحميلهم...")
+
+    def _get_posts():
+        posts = []
+        for p in profile.get_posts():
+            posts.append(p)
+            if len(posts) >= limit:
+                break
+        return posts
+
+    try:
+        posts = await loop.run_in_executor(None, _get_posts)
+    except Exception as e:
+        logger.error(f"Error fetching posts for {username}: {e}")
+        await query.edit_message_text(f"🛑 تعذر جلب قائمة المنشورات: {e}")
+        return
+
+    if not posts:
+        await query.edit_message_text(f"لا توجد منشورات متاحة في حساب @{username}.")
+        return
+
+    total = len(posts)
+    await query.edit_message_text(f"🚀 جاري تحميل وإرسال {total} منشور من حساب @{username}...")
+
+    sent_count = 0
+    req_dir = DOWNLOAD_DIR / f"ig_profile_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
+    req_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        for idx, post in enumerate(posts, 1):
+            post_dir = req_dir / f"post_{idx:03d}"
+            post_dir.mkdir(parents=True, exist_ok=True)
+
+            urls = []
+            if post.typename == "GraphSidecar":
+                for node in post.get_sidecar_nodes():
+                    if node.is_video and node.video_url:
+                        urls.append(node.video_url)
+                    elif node.display_url:
+                        urls.append(node.display_url)
+            elif post.is_video and post.video_url:
+                urls.append(post.video_url)
+            elif post.url:
+                urls.append(post.url)
+
+            if not urls:
+                continue
+
+            post_files = []
+            for u_idx, media_url in enumerate(urls):
+                fp = await loop.run_in_executor(None, download_image_ytdlp, media_url, post_dir, u_idx)
+                if fp and os.path.exists(fp):
+                    fp = str(fix_media_file_extension(Path(fp)))
+                    post_files.append(fp)
+
+            if not post_files:
+                continue
+
+            cap_text = post.caption or ""
+            post_caption = f"📸 منشور {idx} من {total} | @{username}\n\n{cap_text}"[:1000]
+
+            prepared_items = []
+            for pf in post_files:
+                k = "photo" if pf.lower().endswith(IMAGE_EXTS) else "video"
+                prepared_items.append((pf, k))
+
+            v_meta = {}
+            t_cache = {}
+            for p, k in prepared_items:
+                if k == "video":
+                    v_meta[p] = await loop.run_in_executor(None, get_video_metadata, str(p))
+                    t_cache[p] = await loop.run_in_executor(None, extract_thumbnail, str(p))
+
+            sends, _ = await send_media_to_target(
+                context.bot, chat_id, prepared_items, post_caption,
+                v_meta, t_cache, loop
+            )
+            if sends > 0:
+                sent_count += 1
+
+            shutil.rmtree(post_dir, ignore_errors=True)
+            await asyncio.sleep(1.5)
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"✅ اكتملت العملية! تم بنجاح تحميل وإرسال {sent_count} من أصل {total} منشور من حساب @{username}."
+        )
+    finally:
+        shutil.rmtree(req_dir, ignore_errors=True)
+
+
+async def handle_instagram_stories(query, context: ContextTypes.DEFAULT_TYPE, username: str):
+    chat_id = query.message.chat_id
+    loop = asyncio.get_running_loop()
+    await query.edit_message_text(f"⏳ جاري فحص استوري @{username}...")
+
+    try:
+        import instaloader
+        L = get_instaloader_instance()
+        profile = await loop.run_in_executor(None, lambda: instaloader.Profile.from_username(L.context, username))
+    except Exception as e:
+        await query.edit_message_text(f"🛑 تعذر الوصول للاستوري: يتطلب وجود كوكيز حساب إنستجرام في `cookies.txt` ({e}).", parse_mode="Markdown")
+        return
+
+    def _fetch_stories():
+        items = []
+        for story in L.get_stories(userids=[profile.userid]):
+            for item in story.get_items():
+                items.append(item)
+        return items
+
+    try:
+        story_items = await loop.run_in_executor(None, _fetch_stories)
+    except Exception as e:
+        await query.edit_message_text(f"🛑 تعذر تحميل الاستوري: {e}\n(تأكد من وجود كوكيز حساب إنستجرام صالح في cookies.txt)")
+        return
+
+    if not story_items:
+        await query.edit_message_text(f"لا توجد استوري نشطة حالياً في حساب @{username}.")
+        return
+
+    total = len(story_items)
+    await query.edit_message_text(f"⭕ جاري تحميل وإرسال {total} استوري من حساب @{username}...")
+
+    req_dir = DOWNLOAD_DIR / f"ig_stories_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
+    req_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        sent_count = 0
+        for idx, item in enumerate(story_items, 1):
+            u = item.video_url if item.is_video else item.url
+            if not u:
+                continue
+            fp = await loop.run_in_executor(None, download_image_ytdlp, u, req_dir, idx)
+            if fp and os.path.exists(fp):
+                fp = str(fix_media_file_extension(Path(fp)))
+                kind = "video" if item.is_video else "photo"
+                caption = f"⭕ استوري {idx} من {total} | @{username}"
+                v_meta = {fp: await loop.run_in_executor(None, get_video_metadata, str(fp))} if kind == "video" else {}
+                t_cache = {fp: await loop.run_in_executor(None, extract_thumbnail, str(fp))} if kind == "video" else {}
+                s, _ = await send_media_to_target(context.bot, chat_id, [(fp, kind)], caption, v_meta, t_cache, loop)
+                if s > 0:
+                    sent_count += 1
+                try:
+                    os.remove(fp)
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
+
+        await context.bot.send_message(chat_id=chat_id, text=f"✅ تم بنجاح إرسال {sent_count} استوري من حساب @{username}!")
+    finally:
+        shutil.rmtree(req_dir, ignore_errors=True)
+
+
+async def handle_instagram_highlights(query, context: ContextTypes.DEFAULT_TYPE, username: str):
+    chat_id = query.message.chat_id
+    loop = asyncio.get_running_loop()
+    await query.edit_message_text(f"⏳ جاري فحص هايلايتس @{username}...")
+
+    try:
+        import instaloader
+        L = get_instaloader_instance()
+        profile = await loop.run_in_executor(None, lambda: instaloader.Profile.from_username(L.context, username))
+    except Exception as e:
+        await query.edit_message_text(f"🛑 تعذر الوصول للهايلايتس: يتطلب وجود كوكيز حساب إنستجرام في `cookies.txt` ({e}).", parse_mode="Markdown")
+        return
+
+    def _fetch_highlights():
+        hl_list = []
+        for hl in profile.get_highlights():
+            for item in hl.get_items():
+                hl_list.append((hl.title, item))
+                if len(hl_list) >= 30:
+                    break
+            if len(hl_list) >= 30:
+                break
+        return hl_list
+
+    try:
+        hl_items = await loop.run_in_executor(None, _fetch_highlights)
+    except Exception as e:
+        await query.edit_message_text(f"🛑 تعذر تحميل الهايلايتس: {e}\n(تأكد من وجود كوكيز حساب إنستجرام صالح في cookies.txt)")
+        return
+
+    if not hl_items:
+        await query.edit_message_text(f"لا توجد هايلايتس متاحة في حساب @{username}.")
+        return
+
+    total = len(hl_items)
+    await query.edit_message_text(f"⭐ جاري تحميل وإرسال {total} عنصر من هايلايتس @{username}...")
+
+    req_dir = DOWNLOAD_DIR / f"ig_hl_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
+    req_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        sent_count = 0
+        for idx, (hl_title, item) in enumerate(hl_items, 1):
+            u = item.video_url if item.is_video else item.url
+            if not u:
+                continue
+            fp = await loop.run_in_executor(None, download_image_ytdlp, u, req_dir, idx)
+            if fp and os.path.exists(fp):
+                fp = str(fix_media_file_extension(Path(fp)))
+                kind = "video" if item.is_video else "photo"
+                caption = f"⭐ هايلايت: {hl_title} ({idx}/{total}) | @{username}"
+                v_meta = {fp: await loop.run_in_executor(None, get_video_metadata, str(fp))} if kind == "video" else {}
+                t_cache = {fp: await loop.run_in_executor(None, extract_thumbnail, str(fp))} if kind == "video" else {}
+                s, _ = await send_media_to_target(context.bot, chat_id, [(fp, kind)], caption, v_meta, t_cache, loop)
+                if s > 0:
+                    sent_count += 1
+                try:
+                    os.remove(fp)
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
+
+        await context.bot.send_message(chat_id=chat_id, text=f"✅ تم بنجاح إرسال {sent_count} عنصر من هايلايتس @{username}!")
+    finally:
+        shutil.rmtree(req_dir, ignore_errors=True)
 
 
 def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: int, app: Application, progress: dict = None) -> tuple[dict, list]:
@@ -1928,6 +2233,15 @@ async def cancel_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await query.edit_message_text("تعذر العثور على رابط المنشور لإعادة تحميله.")
+    elif query.data.startswith("ig_posts_"):
+        username = query.data.replace("ig_posts_", "")
+        context.application.create_task(handle_instagram_profile_posts(query, context, username, limit=30))
+    elif query.data.startswith("ig_stories_"):
+        username = query.data.replace("ig_stories_", "")
+        context.application.create_task(handle_instagram_stories(query, context, username))
+    elif query.data.startswith("ig_hl_"):
+        username = query.data.replace("ig_hl_", "")
+        context.application.create_task(handle_instagram_highlights(query, context, username))
 
 
 async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2157,6 +2471,12 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
                 "- TikTok: https://vm.tiktok.com/ABC/"
             )
             return
+
+    # Check if the URL is an Instagram profile link
+    ig_profile_user = is_instagram_profile_url(url)
+    if ig_profile_user:
+        await send_instagram_profile_menu(update, context, ig_profile_user)
+        return
 
     # Canonical de-duplication check
     canonical_id, platform_name = get_canonical_post_id(url)
