@@ -55,7 +55,7 @@ AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0").strip().strip('"')
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads").strip().strip('"').strip("'"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip().strip('"').strip("'")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-BOT_VERSION = "v2.9-2gb-local-api-and-lossless-splitter"
+BOT_VERSION = "v3.0-tiktok-photo-fix-and-instagram-album-support"
 
 DB_PATH = Path("archive.db")
 
@@ -98,7 +98,7 @@ def get_canonical_post_id(url: str) -> tuple[str, str]:
     m = re.search(r"(?:x|twitter)\.com/[^/]+/status/(\d+)", url, re.I)
     if m:
         return f"x_{m.group(1)}", "X_Twitter"
-    m = re.search(r"instagram\.com/(?:p|reel|tv|stories)/([A-Za-z0-9_-]+)", url, re.I)
+    m = re.search(r"instagram\.com/(?:p|reel|reels|tv|stories)/([A-Za-z0-9_-]+)", url, re.I)
     if m:
         return f"ig_{m.group(1)}", "Instagram"
     m = re.search(r"tiktok\.com/@[^/]+/(?:video|photo)/(\d+)", url, re.I)
@@ -943,12 +943,47 @@ def extract_thumbnail(video_path: str) -> str | None:
     return None
 
 
+def fix_media_file_extension(fpath: Path) -> Path:
+    """Check magic bytes of the file and ensure its extension matches its actual content.
+    Prevents photos from being mistakenly saved and sent as corrupted/1-second empty videos."""
+    if not fpath.exists() or fpath.stat().st_size < 12:
+        return fpath
+
+    try:
+        with open(fpath, "rb") as f:
+            header = f.read(32)
+
+        new_ext = None
+        if header.startswith(b"\xff\xd8\xff"):
+            new_ext = ".jpg"
+        elif header.startswith(b"\x89PNG\r\n\x1a\n"):
+            new_ext = ".png"
+        elif header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+            new_ext = ".webp"
+        elif header.startswith(b"GIF87a") or header.startswith(b"GIF89a"):
+            new_ext = ".gif"
+        elif b"ftyp" in header[4:16] or header.startswith(b"\x1a\x45\xdf\xa3"):
+            new_ext = ".mp4"
+
+        if new_ext and fpath.suffix.lower() != new_ext:
+            target_path = fpath.with_suffix(new_ext)
+            if target_path.exists():
+                target_path.unlink()
+            fpath.rename(target_path)
+            logger.info(f"Corrected media extension based on magic bytes: {fpath.name} -> {target_path.name}")
+            return target_path
+    except Exception as e:
+        logger.warning(f"Could not check/fix extension for {fpath}: {e}")
+
+    return fpath
+
+
 def _download_direct_url(url: str, dest: Path, timeout: int = 300, progress_cb=None) -> bool:
-    """Download a direct URL (e.g. Twitter/TikTok CDN MP4 or photo) via urllib with proper headers."""
+    """Download a direct URL (e.g. Twitter/TikTok/Instagram CDN MP4 or photo) via urllib with proper headers."""
     referer = "https://x.com/"
     if "tiktok" in url or "tiktokcdn" in url or "tikwm" in url:
         referer = "https://www.tiktok.com/"
-    elif "instagram" in url or "cdninstagram" in url:
+    elif "instagram" in url or "cdninstagram" in url or "fbcdn.net" in url:
         referer = "https://www.instagram.com/"
 
     headers = {
@@ -976,31 +1011,46 @@ def _download_direct_url(url: str, dest: Path, timeout: int = 300, progress_cb=N
 
 
 def download_image_ytdlp(image_url: str, download_path: Path, idx: int, progress_cb=None) -> str:
-    is_video = (
-        ".mp4" in image_url.lower()
-        or "video.twimg.com" in image_url
-        or "mime_type=video_mp4" in image_url
-        or "/video/" in image_url
-        or "tiktokcdn" in image_url
-        or "/play/" in image_url
+    url_low = image_url.lower()
+    is_image = (
+        re.search(r"\.(jpg|jpeg|png|webp)(\?|$)", url_low)
+        or "photomode" in url_low
+        or "image" in url_low
+        or "/photo/" in url_low
     )
-    ext = "mp4" if is_video else "jpg"
-    if ".png" in image_url.lower():
+    is_video = (
+        not is_image
+        and (
+            ".mp4" in url_low
+            or "video.twimg.com" in url_low
+            or "mime_type=video_mp4" in url_low
+            or "/video/" in url_low
+            or "/play/" in url_low
+        )
+    )
+    if is_video:
+        ext = "mp4"
+    elif ".png" in url_low:
         ext = "png"
-    elif ".webp" in image_url.lower():
+    elif ".webp" in url_low:
         ext = "webp"
+    else:
+        ext = "jpg"
     fpath = download_path / f"{idx:05d}.{ext}"
 
-    # If it is a direct image URL (including pbs.twimg.com) or Twitter/TikTok CDN video, download directly via HTTP!
+    # If it is a direct image URL (including pbs.twimg.com, fbcdn.net) or Twitter/TikTok CDN video, download directly via HTTP!
     if (
         "twimg.com" in image_url
         or "tiktokcdn" in image_url
         or "tikwm.com" in image_url
+        or "cdninstagram.com" in image_url
+        or "fbcdn.net" in image_url
         or "mime_type=video_mp4" in image_url
         or re.search(r"\.(jpg|jpeg|png|webp|mp4)(\?|$)", image_url, re.I)
     ):
         logger.info(f"Direct downloading media ({'video' if is_video else 'photo'}): {image_url[:80]}")
         if _download_direct_url(image_url, fpath, progress_cb=progress_cb):
+            fpath = fix_media_file_extension(fpath)
             return str(fpath)
         logger.warning("Direct download failed, falling back to yt-dlp")
 
@@ -1034,7 +1084,8 @@ def download_image_ytdlp(image_url: str, download_path: Path, idx: int, progress
 
     for f in download_path.iterdir():
         if f.name.startswith(f"{idx:05d}.") and f.is_file() and not f.name.endswith(".info.json") and f.stat().st_size > 0:
-            return str(f)
+            fixed_f = fix_media_file_extension(f)
+            return str(fixed_f)
     return None
 
 
@@ -1469,6 +1520,56 @@ def get_tiktok_media(url: str) -> tuple[dict, list]:
     return {}, []
 
 
+def extract_instagram_shortcode(url: str) -> str:
+    m = re.search(r"instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)", url, re.I)
+    return m.group(1) if m else None
+
+
+def get_instagram_media(url: str) -> tuple[dict, list]:
+    """Fetch direct photo, video, or carousel album URLs from Instagram using Instaloader.
+    Handles single photos, multi-photo/video carousels, and reels seamlessly without login."""
+    shortcode = extract_instagram_shortcode(url)
+    if not shortcode:
+        return {}, []
+
+    try:
+        import instaloader
+        L = instaloader.Instaloader(
+            download_pictures=False,
+            download_videos=False,
+            download_video_thumbnails=False,
+            download_geotags=False,
+            download_comments=False,
+            save_metadata=False,
+            compress_json=False,
+            request_timeout=15.0,
+        )
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
+        info = {
+            "title": post.caption or "",
+            "description": post.caption or "",
+            "uploader": post.owner_username or "",
+            "id": shortcode,
+        }
+        urls = []
+        if post.typename == "GraphSidecar":
+            for node in post.get_sidecar_nodes():
+                if node.is_video and node.video_url:
+                    urls.append(node.video_url)
+                elif node.display_url:
+                    urls.append(node.display_url)
+        elif post.is_video and post.video_url:
+            urls.append(post.video_url)
+        elif post.url:
+            urls.append(post.url)
+
+        logger.info(f"Instaloader found {len(urls)} media item(s) for Instagram post {shortcode}")
+        return info, urls
+    except Exception as e:
+        logger.warning(f"Instaloader attempt failed for Instagram post {shortcode}: {e}")
+        return {}, []
+
+
 def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: int, app: Application, progress: dict = None) -> tuple[dict, list]:
     if status_msg_id in cancelled_downloads:
         logger.info(f"Download cancelled by user before extract: {url}")
@@ -1496,6 +1597,7 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
         or "vm.tiktok.com" in url_lower
         or "vt.tiktok.com" in url_lower
     )
+    is_instagram = "instagram.com" in url_lower
 
     _cookie_paths = [COOKIES_FILE, "cookies.txt"] if COOKIES_FILE else ["cookies.txt"]
     have_cookies_file = any(Path(p).exists() for p in _cookie_paths if p)
@@ -1524,6 +1626,17 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
             if not info and tt_info:
                 info = tt_info
             for u in tt_urls:
+                if u not in all_image_urls:
+                    all_image_urls.append(u)
+
+    # For Instagram, first try direct Instaloader extraction for photos, carousels, and reels
+    if is_instagram and not all_image_urls:
+        ig_info, ig_urls = get_instagram_media(url)
+        if ig_urls:
+            logger.info(f"Instagram direct extraction: {len(ig_urls)} media item(s) found")
+            if not info and ig_info:
+                info = ig_info
+            for u in ig_urls:
                 if u not in all_image_urls:
                     all_image_urls.append(u)
 
@@ -1580,6 +1693,17 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
                     if not info and tt_info:
                         info = tt_info
                     for u in tt_urls:
+                        if u not in all_image_urls:
+                            all_image_urls.append(u)
+
+        if is_instagram:
+            after_files = set(f.name for f in download_path.iterdir() if f.is_file() and not f.name.endswith(".info.json"))
+            if not (after_files - before_files) and not all_image_urls:
+                ig_info, ig_urls = get_instagram_media(url)
+                if ig_urls:
+                    if not info and ig_info:
+                        info = ig_info
+                    for u in ig_urls:
                         if u not in all_image_urls:
                             all_image_urls.append(u)
 
@@ -1669,6 +1793,7 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
             pass
 
     downloaded_files = dedupe_thumbnails(downloaded_files)
+    downloaded_files = [str(fix_media_file_extension(Path(fp))) for fp in downloaded_files if os.path.exists(fp)]
 
     if not downloaded_files:
         tail = (last_stderr or "").strip().splitlines()
@@ -2167,6 +2292,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
             caption = (info or {}).get("description", "") or (info or {}).get("title", "") or ""
             await safe_edit(status_msg, f"⬆️ تجهيز {len(file_paths)} ملف للرفع...")
 
+            file_paths = [str(fix_media_file_extension(Path(fp))) for fp in file_paths if os.path.exists(fp)]
             photos = [fp for fp in file_paths if fp.lower().endswith(IMAGE_EXTS)]
             videos = [fp for fp in file_paths if fp.lower().endswith(VIDEO_EXTS)]
             prepared_items = []
