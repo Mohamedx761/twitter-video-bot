@@ -19,6 +19,7 @@ import subprocess
 import json
 import hashlib
 import urllib.request
+from urllib.parse import urlparse, parse_qs
 import threading
 import time
 import uuid
@@ -516,6 +517,12 @@ URL_PATTERNS = [
     r"(?:https?://)?(?:www\.|m\.|web\.)*(?:facebook|fb)\.com/reel/\S+",
     r"(?:https?://)?(?:www\.|m\.|web\.)*(?:facebook|fb)\.com/share/\S+",
     r"(?:https?://)?(?:www\.|m\.|web\.)*(?:facebook|fb)\.com/permalink\.php\S*",
+    # Facebook Profiles & Pages
+    r"(?:https?://)?(?:www\.|m\.|web\.)*(?:facebook|fb)\.com/profile\.php\?id=\d+\S*",
+    r"(?:https?://)?(?:www\.|m\.|web\.)*(?:facebook|fb)\.com/p/[A-Za-z0-9_-]+\S*",
+    r"(?:https?://)?(?:www\.|m\.|web\.)*(?:facebook|fb)\.com/pages/[^/\s]+/[^/\s]+/\d+\S*",
+    r"(?:https?://)?(?:www\.|m\.|web\.)*(?:facebook|fb)\.com/[A-Za-z0-9_\.]+/?(?:\?[^\s]*)?",
+    r"(?:https?://)?fb\.com/[A-Za-z0-9_\.]+/?(?:\?[^\s]*)?",
 ]
 
 
@@ -528,6 +535,7 @@ def extract_url(text: str) -> str:
         r"tiktok\.com/(?:tiktoklite|download|app|about|legal|privacy)(?:/|\?|$)",
         r"instagram\.com/(?:about|legal|download|explore|accounts|developer|directory)(?:/|\?|$)",
         r"(?:x|twitter)\.com/(?:download|about)(?:/|\?|$)",
+        r"(?:facebook|fb)\.com/(?:help|about|legal|privacy|policies|login|recover|reg)(?:/|\?|$)",
     ]
 
     for pattern in URL_PATTERNS:
@@ -2033,34 +2041,74 @@ async def handle_instagram_stories(query, context: ContextTypes.DEFAULT_TYPE, us
     try:
         import instaloader
         L = get_instaloader_instance()
+    except Exception as e:
+        await safe_edit_message(query, f"🛑 تعذر تهيئة مكتبة إنستجرام: {e}")
+        return
+
+    # Instagram strictly requires an authenticated session for stories
+    if not L.context.is_logged_in:
+        await safe_edit_message(
+            query,
+            f"🛑 **يتطلب تحميل الاستوري تسجيل الدخول لحسابك:**\n\n"
+            f"خوادم إنستجرام تفرض وجود جلسة مسجلة لمشاهدة الاستوري والهايلايتس.\n\n"
+            f"🔑 **طريقة التفعيل في خطوة واحدة (اختر إحداهما):**\n"
+            f"1️⃣ انسخ كود الـ `sessionid` واكتب هنا: `/session <الكود>`\n"
+            f"2️⃣ أو أرسل ملف `cookies.txt` هنا كملف عادي 📎 في الشات.\n\n"
+            f"⚡ بمجرد حفظ الجلسة سيعمل تحميل الاستوري والهايلايتس فوراً بدون أي حظر!",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
         profile = await loop.run_in_executor(None, lambda: instaloader.Profile.from_username(L.context, username))
     except Exception as e:
         err_str = str(e)
         logger.error(f"Failed to fetch profile for stories {username}: {e}")
-        is_auth_barrier = any(w in err_str.lower() for w in ["429", "302", "401", "403", "login", "redirect", "checkpoint", "two-factor", "cookie", "found when accessing"])
+        is_auth_barrier = any(w in err_str.lower() for w in ["429", "302", "401", "403", "login", "redirect", "checkpoint", "two-factor", "cookie", "session", "found when accessing"])
         if is_auth_barrier:
             await safe_edit_message(
                 query,
-                f"🛑 **يتطلب تحميل الاستوري تسجيل الدخول لحسابك:**\n\n"
-                f"إنستجرام يشترط وجود جلسة مسجلة لمشاهدة الاستوري.\n"
-                f"يرجى إرسال ملف `cookies.txt` هنا في الشات مع البوت كملف 📎 لتفعيل تحميل الاستوري فوراً.",
+                f"🛑 **انتهت صلاحية جلسة إنستجرام (Session Expired):**\n\n"
+                f"يرجى تجديد الجلسة بإرسال كود الـ `sessionid` الجديد عبر: `/session <الكود>` أو إرسال ملف `cookies.txt` محدث 📎.",
                 parse_mode="Markdown"
             )
         else:
-            await safe_edit_message(query, f"🛑 تعذر الوصول للاستوري: {e}")
+            await safe_edit_message(query, f"🛑 تعذر العثور على الحساب @{username}: {e}")
+        return
+
+    if getattr(profile, "is_private", False) and not getattr(profile, "followed_by_viewer", True):
+        await safe_edit_message(
+            query,
+            f"🔒 **حساب إنستجرام خاص (Private):**\n\n"
+            f"الحساب `@{username}` مقفل ولا يمكن مشاهدة استورياته إلا إذا كان حسابك يتابعه بالفعل.",
+            parse_mode="Markdown"
+        )
         return
 
     def _fetch_stories():
         items = []
-        for story in L.get_stories(userids=[profile.userid]):
-            for item in story.get_items():
-                items.append(item)
+        uid = getattr(profile, "userid", None) or getattr(profile, "id", None)
+        if uid:
+            for story in L.get_stories(userids=[uid]):
+                for item in story.get_items():
+                    items.append(item)
         return items
 
     try:
         story_items = await asyncio.wait_for(loop.run_in_executor(None, _fetch_stories), timeout=45)
     except Exception as e:
-        await safe_edit_message(query, f"🛑 تعذر تحميل الاستوري: يتطلب وجود كوكيز حساب إنستجرام صالح في `cookies.txt` ({e}).", parse_mode="Markdown")
+        err_str = str(e)
+        logger.warning(f"Error fetching stories for {username}: {e}")
+        is_auth_barrier = any(w in err_str.lower() for w in ["login", "401", "403", "429", "redirect", "session", "cookie"])
+        if is_auth_barrier:
+            await safe_edit_message(
+                query,
+                f"🛑 **جلسة إنستجرام غير صالحة لمشاهدة الاستوري:**\n\n"
+                f"يرجى تجديد جلسة الدخول عبر الأمر `/session <كود sessionid>` أو إرسال ملف `cookies.txt` جديد 📎.",
+                parse_mode="Markdown"
+            )
+        else:
+            await safe_edit_message(query, f"🛑 تعذر تحميل الاستوري: {e}")
         return
 
     if not story_items:
@@ -2136,26 +2184,53 @@ async def handle_instagram_highlights(query, context: ContextTypes.DEFAULT_TYPE,
     try:
         import instaloader
         L = get_instaloader_instance()
+    except Exception as e:
+        await safe_edit_message(query, f"🛑 تعذر تهيئة مكتبة إنستجرام: {e}")
+        return
+
+    # Instagram strictly requires an authenticated session for highlights
+    if not L.context.is_logged_in:
+        await safe_edit_message(
+            query,
+            f"🛑 **يتطلب تحميل الهايلايتس تسجيل الدخول لحسابك:**\n\n"
+            f"خوادم إنستجرام تفرض وجود جلسة مسجلة لمشاهدة الهايلايتس.\n\n"
+            f"🔑 **طريقة التفعيل في خطوة واحدة (اختر إحداهما):**\n"
+            f"1️⃣ انسخ كود الـ `sessionid` واكتب هنا: `/session <الكود>`\n"
+            f"2️⃣ أو أرسل ملف `cookies.txt` هنا كملف عادي 📎 في الشات.\n\n"
+            f"⚡ بمجرد حفظ الجلسة سيعمل تحميل الهايلايتس فوراً بدون أي حظر!",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
         profile = await loop.run_in_executor(None, lambda: instaloader.Profile.from_username(L.context, username))
     except Exception as e:
         err_str = str(e)
         logger.error(f"Failed to fetch profile for highlights {username}: {e}")
-        is_auth_barrier = any(w in err_str.lower() for w in ["429", "302", "401", "403", "login", "redirect", "checkpoint", "two-factor", "cookie", "found when accessing"])
+        is_auth_barrier = any(w in err_str.lower() for w in ["429", "302", "401", "403", "login", "redirect", "checkpoint", "two-factor", "cookie", "session", "found when accessing"])
         if is_auth_barrier:
             await safe_edit_message(
                 query,
-                f"🛑 **يتطلب تحميل الهايلايتس تسجيل الدخول لحسابك:**\n\n"
-                f"إنستجرام يشترط وجود جلسة مسجلة لمشاهدة الهايلايتس.\n"
-                f"يرجى إرسال ملف `cookies.txt` هنا في الشات مع البوت كملف 📎 لتفعيل تحميل الهايلايتس فوراً.",
+                f"🛑 **انتهت صلاحية جلسة إنستجرام (Session Expired):**\n\n"
+                f"يرجى تجديد الجلسة بإرسال كود الـ `sessionid` الجديد عبر: `/session <الكود>` أو إرسال ملف `cookies.txt` محدث 📎.",
                 parse_mode="Markdown"
             )
         else:
-            await safe_edit_message(query, f"🛑 تعذر الوصول للهايلايتس: {e}")
+            await safe_edit_message(query, f"🛑 تعذر العثور على الحساب @{username}: {e}")
+        return
+
+    if getattr(profile, "is_private", False) and not getattr(profile, "followed_by_viewer", True):
+        await safe_edit_message(
+            query,
+            f"🔒 **حساب إنستجرام خاص (Private):**\n\n"
+            f"الحساب `@{username}` مقفل ولا يمكن مشاهدة الهايلايتس إلا إذا كان حسابك يتابعه بالفعل.",
+            parse_mode="Markdown"
+        )
         return
 
     def _fetch_highlights():
         hl_list = []
-        for hl in profile.get_highlights():
+        for hl in L.get_highlights(profile):
             for item in hl.get_items():
                 hl_list.append((hl.title, item))
                 if len(hl_list) >= 30:
@@ -2167,7 +2242,18 @@ async def handle_instagram_highlights(query, context: ContextTypes.DEFAULT_TYPE,
     try:
         hl_items = await asyncio.wait_for(loop.run_in_executor(None, _fetch_highlights), timeout=45)
     except Exception as e:
-        await safe_edit_message(query, f"🛑 تعذر تحميل الهايلايتس: يتطلب وجود كوكيز حساب إنستجرام صالح في `cookies.txt` ({e}).", parse_mode="Markdown")
+        err_str = str(e)
+        logger.warning(f"Error fetching highlights for {username}: {e}")
+        is_auth_barrier = any(w in err_str.lower() for w in ["login", "401", "403", "429", "redirect", "session", "cookie"])
+        if is_auth_barrier:
+            await safe_edit_message(
+                query,
+                f"🛑 **جلسة إنستجرام غير صالحة لمشاهدة الهايلايتس:**\n\n"
+                f"يرجى تجديد جلسة الدخول عبر الأمر `/session <كود sessionid>` أو إرسال ملف `cookies.txt` جديد 📎.",
+                parse_mode="Markdown"
+            )
+        else:
+            await safe_edit_message(query, f"🛑 تعذر تحميل الهايلايتس: {e}")
         return
 
     if not hl_items:
@@ -2230,6 +2316,406 @@ async def handle_instagram_highlights(query, context: ContextTypes.DEFAULT_TYPE,
         if failed_count > 0:
             res_text += f"\n⚠️ (تعذر إرسال {failed_count} عنصر)."
         await safe_edit_message(query, res_text, parse_mode="Markdown")
+    finally:
+        shutil.rmtree(req_dir, ignore_errors=True)
+
+
+def is_facebook_profile_url(url: str) -> str | None:
+    """If url is a Facebook profile or page link, return the identifier (username or id). Otherwise None."""
+    clean = url.strip()
+    if not clean.lower().startswith(("http://", "https://")):
+        clean = "https://" + clean
+
+    parsed = urlparse(clean)
+    netloc = parsed.netloc.lower()
+    if not any(domain in netloc for domain in ["facebook.com", "fb.com", "fb.me"]):
+        return None
+
+    path = parsed.path.strip("/")
+    parts = [p for p in path.split("/") if p]
+
+    if not parts or parts[0].lower() == "profile.php":
+        qs = parse_qs(parsed.query)
+        if "id" in qs:
+            return qs["id"][0]
+        return None
+
+    first = parts[0].lower()
+
+    system_paths = {
+        "watch", "reel", "reels", "stories", "story.php", "permalink.php",
+        "share", "photo.php", "photos", "videos", "posts", "groups", "events",
+        "marketplace", "gaming", "watchparty", "ads", "login", "help", "about",
+        "legal", "privacy", "settings", "messages", "notifications", "search",
+        "home.php", "pages", "live", "flx", "dialog", "plugins"
+    }
+
+    if first == "pages" and len(parts) >= 3:
+        return parts[-1]
+    if first == "p" and len(parts) >= 2:
+        return parts[1]
+
+    if first in system_paths:
+        return None
+
+    if len(parts) >= 2 and parts[1].lower() in {"videos", "posts", "photos", "reels"}:
+        if len(parts) >= 3:
+            return None
+        return parts[0]
+
+    if len(parts) == 1:
+        return parts[0]
+
+    return None
+
+
+async def send_facebook_profile_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, target: str):
+    """Sends an interactive menu for Facebook profile/page downloads."""
+    if len(target) > 35:
+        target_key = "saved"
+        if context.user_data is not None:
+            context.user_data["last_fb_target"] = target
+    else:
+        target_key = target
+
+    keyboard = [
+        [
+            InlineKeyboardButton("📹 تحميل آخر 10 فيديوهات (Videos)", callback_data=f"fb_vids_{target_key}"),
+            InlineKeyboardButton("⭕ تحميل الريلز (Reels)", callback_data=f"fb_reels_{target_key}"),
+        ],
+        [
+            InlineKeyboardButton("📄 تحميل آخر المنشورات (Posts)", callback_data=f"fb_posts_{target_key}"),
+            InlineKeyboardButton("📖 الاستوري (Stories)", callback_data=f"fb_stories_{target_key}"),
+        ],
+        [
+            InlineKeyboardButton("❌ إلغاء", callback_data="cancel_download"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    text = (
+        f"👤 **بروفايل / صفحة فيسبوك:** `{target}`\n\n"
+        f"اختر ما تريد تحميله من الحساب:"
+    )
+    if update.message:
+        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
+
+def extract_facebook_media_links_from_html(html: str, target: str = "") -> dict:
+    """Extracts unique Facebook video, reel, and post URLs from raw HTML or embedded JSON."""
+    results = {
+        "videos": [],
+        "reels": [],
+        "posts": [],
+    }
+    seen_vids = set()
+    seen_reels = set()
+    seen_posts = set()
+
+    # 1. Reels
+    reel_patterns = [
+        r'/reel/(\d{10,22})',
+        r'facebook\.com/reel/(\d{10,22})',
+        r'"reel_id":"(\d{10,22})"',
+        r'"short_form_video_context":\{"video":\{"id":"(\d+)"',
+        r'reel_id%22%3A%22(\d{10,22})%22',
+    ]
+    for pat in reel_patterns:
+        for rid in re.findall(pat, html):
+            if rid not in seen_reels:
+                seen_reels.add(rid)
+                results["reels"].append(f"https://www.facebook.com/reel/{rid}/")
+
+    # 2. Videos
+    video_patterns = [
+        r'/(?:[^/"\'\s]+)/videos/(\d{10,22})',
+        r'/watch/\?v=(\d{10,22})',
+        r'facebook\.com/watch/\?v=(\d{10,22})',
+        r'"video_id":"(\d{10,22})"',
+        r'"playback_video":\{"id":"(\d+)"',
+        r'"id":"(\d{12,22})","__typename":"Video"',
+        r'"__typename":"Video","id":"(\d{12,22})"',
+        r'video_id%22%3A%22(\d{10,22})%22',
+    ]
+    for pat in video_patterns:
+        for vid in re.findall(pat, html):
+            if vid not in seen_vids and vid not in seen_reels:
+                seen_vids.add(vid)
+                results["videos"].append(f"https://www.facebook.com/watch/?v={vid}")
+
+    # 3. Posts
+    post_patterns = [
+        r'/posts/(pfbid[A-Za-z0-9]+|\d{10,22})',
+        r'story_fbid=([A-Za-z0-9_]+)',
+        r'"post_id":"(\d{10,22})"',
+    ]
+    for pat in post_patterns:
+        for pid in re.findall(pat, html):
+            if pid not in seen_posts and pid not in seen_vids and pid not in seen_reels:
+                seen_posts.add(pid)
+                if pid.startswith("pfbid") or not pid.isdigit():
+                    results["posts"].append(f"https://www.facebook.com/{target or 'post'}/posts/{pid}")
+                elif target:
+                    results["posts"].append(f"https://www.facebook.com/{target}/posts/{pid}")
+                else:
+                    results["posts"].append(f"https://www.facebook.com/story.php?story_fbid={pid}")
+
+    return results
+
+
+def fetch_facebook_profile_media(target: str, media_type: str = "videos", limit: int = 10) -> tuple[list[str], str | None]:
+    """Fetches media URLs (reels, videos, posts, stories) from a Facebook profile or page."""
+    import urllib.request
+    import http.cookiejar
+
+    cookie_paths = [COOKIES_FILE, "cookies.txt"] if COOKIES_FILE else ["cookies.txt"]
+    cj = http.cookiejar.MozillaCookieJar()
+    has_cookies = False
+    has_fb_session = False
+
+    for cp in cookie_paths:
+        if cp and Path(cp).exists():
+            try:
+                cj.load(cp, ignore_discard=True, ignore_expires=True)
+                for c in cj:
+                    if "facebook.com" in c.domain:
+                        has_cookies = True
+                        if c.name in ("c_user", "xs"):
+                            has_fb_session = True
+                if has_cookies:
+                    break
+            except Exception as ce:
+                logger.warning(f"Could not load cookies from {cp}: {ce}")
+
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+
+    urls_to_try = []
+    if media_type == "reels":
+        urls_to_try = [
+            f"https://www.facebook.com/{target}/reels/",
+            f"https://m.facebook.com/{target}/reels/",
+            f"https://www.facebook.com/{target}/reels_tab/",
+        ]
+    elif media_type == "videos":
+        urls_to_try = [
+            f"https://www.facebook.com/{target}/videos/",
+            f"https://m.facebook.com/{target}/videos/",
+            f"https://www.facebook.com/{target}/",
+        ]
+    elif media_type == "stories":
+        urls_to_try = [
+            f"https://www.facebook.com/stories/{target}/",
+            f"https://m.facebook.com/stories/{target}/",
+        ]
+    else:  # posts
+        urls_to_try = [
+            f"https://www.facebook.com/{target}/",
+            f"https://m.facebook.com/{target}/",
+        ]
+
+    headers_desktop = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Dest": "document",
+    }
+    headers_mobile = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    all_html = ""
+    is_login_blocked = False
+
+    for u in urls_to_try:
+        hdrs = headers_mobile if "m.facebook.com" in u else headers_desktop
+        try:
+            req = urllib.request.Request(u, headers=hdrs)
+            with opener.open(req, timeout=15) as resp:
+                final_url = resp.geturl()
+                if "login.php" in final_url or "/login/" in final_url:
+                    is_login_blocked = True
+                    continue
+                content = resp.read().decode("utf-8", errors="ignore")
+                if "<title>Log in to Facebook" in content or "login_form" in content:
+                    is_login_blocked = True
+                    continue
+                all_html += "\n" + content
+        except Exception as e:
+            err_msg = str(e).lower()
+            if any(w in err_msg for w in ["302", "401", "403", "login", "redirect"]):
+                is_login_blocked = True
+            logger.warning(f"Error fetching Facebook {u}: {e}")
+
+    extracted = extract_facebook_media_links_from_html(all_html, target=target)
+
+    if media_type == "reels":
+        candidates = extracted["reels"] or extracted["videos"]
+    elif media_type == "videos":
+        candidates = extracted["videos"] or extracted["reels"]
+    elif media_type == "stories":
+        candidates = extracted["videos"] or extracted["reels"]
+    else:  # posts
+        candidates = extracted["posts"] or extracted["videos"] or extracted["reels"]
+
+    if not candidates and (is_login_blocked or not has_fb_session):
+        return [], "AUTH_REQUIRED"
+
+    return candidates[:limit], None
+
+
+async def handle_facebook_profile_content(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    target: str,
+    content_type: str = "videos",
+    limit: int = 10
+):
+    chat_id = query.message.chat_id
+    loop = asyncio.get_running_loop()
+    start_time = time.time()
+
+    type_labels = {
+        "videos": "الفيديوهات",
+        "reels": "الريلز",
+        "posts": "المنشورات",
+        "stories": "الاستوري",
+    }
+    label = type_labels.get(content_type, "المحتوى")
+
+    await safe_edit_message(query, f"⏳ جاري فحص حساب فيسبوك ({target}) وجلب {label}...")
+
+    candidates, err = await loop.run_in_executor(
+        None, lambda: fetch_facebook_profile_media(target, media_type=content_type, limit=limit)
+    )
+
+    if err == "AUTH_REQUIRED" or (not candidates and err):
+        await safe_edit_message(
+            query,
+            f"🛑 **يتطلب فيسبوك تسجيل الدخول لتصفح حساب `{target}`:**\n\n"
+            f"خوادم فيسبوك تمنع استعراض محتوى الحسابات والصفحات بدون تسجيل دخول (`Login Required`).\n\n"
+            f"🔑 **طريقة تشغيل التحميل بسهولة في دقيقة:**\n"
+            f"1️⃣ افتح Facebook على متصفحك وسجل دخول لحسابك.\n"
+            f"2️⃣ استخرج ملف الكوكيز `cookies.txt` (باستخدام إضافة مثل *Get cookies.txt LOCALLY*).\n"
+            f"3️⃣ أرسل ملف `cookies.txt` هنا في شات البوت كملف عادي 📎.\n\n"
+            f"⚡ سيتعرف عليه البوت تلقائياً ويعمل معك تحميل الفيديوهات والريلز والاستوري فوراً بدون أي قيود!",
+            parse_mode="Markdown"
+        )
+        return
+
+    if not candidates:
+        await safe_edit_message(
+            query,
+            f"ℹ️ لم يتم العثور على أي {label} متاحة في حساب فيسبوك ({target}).\n"
+            f"قد يكون الحساب مقفلاً أو لا يحتوي على عناصر منشورة حالياً."
+        )
+        return
+
+    total = len(candidates)
+    sent_count = 0
+    failed_count = 0
+    req_dir = DOWNLOAD_DIR / f"fb_profile_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
+    req_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        for idx, item_url in enumerate(candidates, 1):
+            elapsed = int(time.time() - start_time)
+            bar = make_progress_bar(idx - 1, total, length=10)
+            status_text = (
+                f"📥 **جاري تحميل {label} فيسبوك ({target}):**\n"
+                f"{bar} ({idx - 1}/{total} تم إرساله)\n\n"
+                f"⏳ **جاري الآن معالجة العنصر {idx} من {total}...**\n"
+                f"✅ تم بنجاح: {sent_count} | ⏱️ الوقت: {elapsed}ث"
+            )
+            await safe_edit_message(query, status_text, parse_mode="Markdown")
+
+            item_dir = req_dir / f"item_{idx:03d}"
+            item_dir.mkdir(parents=True, exist_ok=True)
+
+            try:
+                progress_dict = {}
+                await loop.run_in_executor(
+                    None,
+                    lambda: run_ytdlp_download(
+                        item_url, item_dir,
+                        is_carousel=False, is_x=False,
+                        use_cookies=True,
+                        progress=progress_dict,
+                        timeout=90
+                    )
+                )
+
+                found_files = [
+                    f for f in item_dir.iterdir()
+                    if f.is_file() and not f.name.endswith(".info.json") and f.stat().st_size > 0
+                ]
+
+                if not found_files:
+                    logger.warning(f"No media files downloaded for Facebook item {idx}: {item_url}")
+                    failed_count += 1
+                    continue
+
+                prepared_items = []
+                for pf in found_files:
+                    fixed_p = fix_media_file_extension(pf)
+                    p_str = str(fixed_p)
+                    k = "photo" if p_str.lower().endswith(IMAGE_EXTS) else "video"
+                    if k == "video" and os.path.exists(p_str):
+                        sz = os.path.getsize(p_str)
+                        if sz > 50 * 1024 * 1024:
+                            try:
+                                compressed = await loop.run_in_executor(
+                                    None, lambda: compress_video_ffmpeg(p_str, item_dir)
+                                )
+                                if compressed and os.path.exists(compressed):
+                                    p_str = compressed
+                            except Exception as ce:
+                                logger.warning(f"Compression failed for {p_str}: {ce}")
+                    prepared_items.append((p_str, k))
+
+                caption = f"📘 فيسبوك: {label} ({idx}/{total}) | {target}"
+                v_meta = {}
+                t_cache = {}
+                for p, k in prepared_items:
+                    if k == "video":
+                        v_meta[p] = await loop.run_in_executor(None, get_video_metadata, str(p))
+                        t_cache[p] = await loop.run_in_executor(None, extract_thumbnail, str(p))
+
+                sends, _ = await send_media_to_target(
+                    context.bot, chat_id, prepared_items, caption,
+                    v_meta, t_cache, loop
+                )
+                if sends > 0:
+                    sent_count += 1
+                else:
+                    failed_count += 1
+
+            except Exception as ie:
+                logger.error(f"Error processing Facebook item {idx} ({item_url}): {ie}")
+                failed_count += 1
+            finally:
+                shutil.rmtree(item_dir, ignore_errors=True)
+
+            await asyncio.sleep(1.5)
+
+        final_bar = make_progress_bar(sent_count, total, length=10)
+        elapsed_total = int(time.time() - start_time)
+        res_text = (
+            f"✅ **اكتمل تحميل {label} فيسبوك بنجاح!**\n\n"
+            f"{final_bar} تم إرسال {sent_count} من أصل {total} عنصر من حساب {target}.\n"
+            f"⏱️ إجمالي الوقت المستغرق: {elapsed_total} ثانية."
+        )
+        if failed_count > 0:
+            res_text += f"\n⚠️ (تعذر إرسال {failed_count} عنصر بسبب قيود وصول فيسبوك)."
+        await safe_edit_message(query, res_text, parse_mode="Markdown")
+
+    except Exception as ge:
+        logger.error(f"Unexpected error in handle_facebook_profile_content: {ge}", exc_info=True)
+        await safe_edit_message(query, f"🛑 حدث خطأ أثناء معالجة حساب فيسبوك: {ge}")
     finally:
         shutil.rmtree(req_dir, ignore_errors=True)
 
@@ -2602,6 +3088,26 @@ async def cancel_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data.startswith("ig_hl_"):
         username = query.data.replace("ig_hl_", "")
         context.application.create_task(handle_instagram_highlights(query, context, username))
+    elif query.data.startswith("fb_vids_"):
+        target = query.data.replace("fb_vids_", "")
+        if target == "saved" and context.user_data:
+            target = context.user_data.get("last_fb_target", target)
+        context.application.create_task(handle_facebook_profile_content(query, context, target, content_type="videos", limit=10))
+    elif query.data.startswith("fb_reels_"):
+        target = query.data.replace("fb_reels_", "")
+        if target == "saved" and context.user_data:
+            target = context.user_data.get("last_fb_target", target)
+        context.application.create_task(handle_facebook_profile_content(query, context, target, content_type="reels", limit=10))
+    elif query.data.startswith("fb_posts_"):
+        target = query.data.replace("fb_posts_", "")
+        if target == "saved" and context.user_data:
+            target = context.user_data.get("last_fb_target", target)
+        context.application.create_task(handle_facebook_profile_content(query, context, target, content_type="posts", limit=10))
+    elif query.data.startswith("fb_stories_"):
+        target = query.data.replace("fb_stories_", "")
+        if target == "saved" and context.user_data:
+            target = context.user_data.get("last_fb_target", target)
+        context.application.create_task(handle_facebook_profile_content(query, context, target, content_type="stories", limit=10))
 
 
 async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2611,10 +3117,10 @@ async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🍪 **إعداد ملف الكوكيز (cookies.txt):**\n\n"
         "أرسل ملف `cookies.txt` هنا مباشرة كملف عادي (📎 Document).\n\n"
-        "💡 **لتصدير كوكيز إنستجرام بشكل صحيح:**\n"
-        "1. افتح موقع Instagram.com على متصفحك وسجل الدخول لحسابك.\n"
-        "2. استخدم إضافة مثل *Get cookies.txt LOCALLY* واضغط **Export**.\n"
-        "3. أرسل الملف الناتج هنا، وسيقوم البوت بدمجه وتفعيله فوراً!",
+        "💡 **لتصدير كوكيز إنستجرام أو فيسبوك بشكل صحيح:**\n"
+        "1. افتح الموقع (Instagram أو Facebook) على متصفحك وسجل الدخول بحسابك.\n"
+        "2. استخدم إضافة متصفح مثل *Get cookies.txt LOCALLY* واضغط **Export**.\n"
+        "3. أرسل الملف الناتج هنا، وسيقوم البوت بدمجه وتفعيله فوراً لتحميل البروفايلات والاستوري والريلز!",
         parse_mode="Markdown"
     )
 
@@ -2655,6 +3161,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Inspect what cookies were uploaded
         has_instagram = "instagram.com" in new_content
         has_ig_session = "sessionid" in new_content
+        has_facebook = "facebook.com" in new_content
+        has_fb_auth = "c_user" in new_content or "xs" in new_content
         has_twitter = "twitter.com" in new_content or "x.com" in new_content
         has_tw_auth = "auth_token" in new_content
 
@@ -2674,17 +3182,27 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "💡 *أو يمكنك بدلاً من ذلك نسخ الـ `sessionid` وكتابة الأمر:* `/session <كود>`"
                 )
 
+        if has_facebook:
+            if has_fb_auth:
+                msg_parts.append("📘 **فيسبوك:** تم التعرف على جلسة تسجيل الدخول (`c_user`/`xs` موجود) ✅\nيمكنك الآن تحميل الفيديوهات والريلز والاستوري من حسابات وصفحات فيسبوك فوراً!")
+            else:
+                msg_parts.append(
+                    "⚠️ **فيسبوك: تنبيه هام!**\n"
+                    "الملف يحتوي على كوكيز فيسبوك ولكن **غير مسجل الدخول (`c_user` مفقود)**.\n"
+                    "👉 يرجى تسجيل الدخول لحسابك على Facebook أولاً، ثم الضغط على Export وإرسال الملف الجديد."
+                )
+
         if has_twitter:
             if has_tw_auth:
                 msg_parts.append("🐦 **تويتر/X:** تم تفعيل كوكيز تسجيل الدخول (`auth_token` موجود) ✅")
             else:
                 msg_parts.append("🐦 **تويتر/X:** كوكيز عامة بدون تسجيل دخول.")
 
-        if not has_instagram and not has_twitter:
+        if not has_instagram and not has_facebook and not has_twitter:
             msg_parts.append("📁 تم حفظ ملف الكوكيز وتفعيله للأدوات التلقائية.")
 
         await update.message.reply_text("\n\n".join(msg_parts), parse_mode="Markdown")
-        logger.info(f"Cookies updated: ig={has_instagram}(session={has_ig_session}), tw={has_twitter}")
+        logger.info(f"Cookies updated: ig={has_instagram}(session={has_ig_session}), fb={has_facebook}(auth={has_fb_auth}), tw={has_twitter}")
 
     except Exception as e:
         logger.error(f"Failed to process uploaded cookies: {e}")
@@ -2921,6 +3439,12 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
     ig_profile_user = is_instagram_profile_url(url)
     if ig_profile_user:
         await send_instagram_profile_menu(update, context, ig_profile_user)
+        return
+
+    # Check if the URL is a Facebook profile or page link
+    fb_profile_target = is_facebook_profile_url(url)
+    if fb_profile_target:
+        await send_facebook_profile_menu(update, context, fb_profile_target)
         return
 
     # Canonical de-duplication check
