@@ -57,7 +57,7 @@ AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0").strip().strip('"')
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads").strip().strip('"').strip("'"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip().strip('"').strip("'")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-BOT_VERSION = "v3.6-720p-default-quality-and-smart-1gb-half-splitting"
+BOT_VERSION = "v3.7-strict-720p-dedup-and-verified-half-split"
 
 DB_PATH = Path("archive.db")
 
@@ -272,16 +272,31 @@ def restore_cookies_from_settings():
 
 
 def get_video_duration(path: str) -> float:
-    """Get video duration in seconds using ffprobe."""
+    """Get video duration in seconds using ffprobe (format duration with stream duration fallback)."""
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True, text=True, timeout=30
         )
-        return float(result.stdout.strip())
+        val = float(result.stdout.strip())
+        if val > 0:
+            return val
     except Exception:
-        return 0.0
+        pass
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+             "-show_entries", "stream=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=30
+        )
+        val = float(result.stdout.strip())
+        if val > 0:
+            return val
+    except Exception:
+        pass
+    return 0.0
 
 
 def get_video_metadata(path: str) -> dict:
@@ -524,7 +539,7 @@ def split_video(input_path: str, output_dir: Path | str, target_mb: float = 42.0
 
 def choose_twitter_video_url(formats_or_variants: list, target_quality: str = None) -> str:
     """Selects the video URL closest to target_quality (default 720p).
-    If target is 720p: picks the highest quality <= 720p. If none <= 720p, picks the lowest > 720p."""
+    If target is 720p: strictly prioritizes highest quality <= 720p (never 1080p)."""
     if not target_quality:
         target_quality = get_target_quality()
 
@@ -544,11 +559,24 @@ def choose_twitter_video_url(formats_or_variants: list, target_quality: str = No
         w = item.get("width")
         h = item.get("height")
         if not (w and h):
-            m = re.search(r"/(\d+)x(\d+)/", url)
+            # Matches /720x1280/, /720x1280.mp4, _720x1280.mp4, 1280x720, etc.
+            m = re.search(r"(?:^|[^0-9])([0-9]{2,4})x([0-9]{2,4})(?:[^0-9]|$)", url)
             if m:
                 w, h = int(m.group(1)), int(m.group(2))
 
         p_val = min(w, h) if (w and h) else 0
+
+        # If p_val still 0, deduce from standard Twitter bitrates
+        if p_val == 0 and bitrate:
+            if bitrate >= 3_500_000:
+                p_val = 1080
+            elif bitrate >= 1_500_000:
+                p_val = 720
+            elif bitrate >= 600_000:
+                p_val = 480
+            else:
+                p_val = 360
+
         mp4_items.append({"url": url, "bitrate": bitrate or 0, "p_val": p_val})
 
     if not mp4_items:
@@ -564,7 +592,7 @@ def choose_twitter_video_url(formats_or_variants: list, target_quality: str = No
     except Exception:
         target_p = 720
 
-    # 1. Prefer formats <= target_p (e.g. <= 720p)
+    # 1. Strictly prefer formats <= target_p (e.g. <= 720p), picking highest resolution & bitrate
     under_or_equal = [x for x in mp4_items if x["p_val"] > 0 and x["p_val"] <= target_p]
     if under_or_equal:
         under_or_equal.sort(key=lambda x: (x["p_val"], x["bitrate"]), reverse=True)
@@ -582,7 +610,10 @@ def choose_twitter_video_url(formats_or_variants: list, target_quality: str = No
 
 
 def split_video_into_halves(input_path: str, output_dir: Path | str) -> list[str]:
-    """Split video > 1GB into 2 equal halves losslessly using ffmpeg stream copy (-c copy)."""
+    """Split video > 1GB into 2 equal halves losslessly using ffmpeg stream copy (-c copy).
+    Part 1: 00:00:00 to half duration (first half)
+    Part 2: half duration to end of video (second half)
+    """
     input_path = str(input_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -603,6 +634,7 @@ def split_video_into_halves(input_path: str, output_dir: Path | str) -> list[str
         "-t", str(half_dur),
         "-c", "copy",
         "-map", "0",
+        "-avoid_negative_ts", "make_zero",
         "-reset_timestamps", "1",
         "-movflags", "+faststart",
         p1
@@ -611,6 +643,7 @@ def split_video_into_halves(input_path: str, output_dir: Path | str) -> list[str
         "ffmpeg", "-y", "-ss", str(half_dur), "-i", input_path,
         "-c", "copy",
         "-map", "0",
+        "-avoid_negative_ts", "make_zero",
         "-reset_timestamps", "1",
         "-movflags", "+faststart",
         p2
@@ -623,8 +656,12 @@ def split_video_into_halves(input_path: str, output_dir: Path | str) -> list[str
             proc1.returncode == 0 and os.path.exists(p1) and os.path.getsize(p1) > 1024 and
             proc2.returncode == 0 and os.path.exists(p2) and os.path.getsize(p2) > 1024
         ):
-            logger.info(f"[split_halves] Successfully split {Path(input_path).name} into 2 halves: {p1} ({os.path.getsize(p1)/(1024*1024):.1f}MB), {p2} ({os.path.getsize(p2)/(1024*1024):.1f}MB)")
+            dur1 = get_video_duration(p1)
+            dur2 = get_video_duration(p2)
+            logger.info(f"[split_halves] Successfully split {Path(input_path).name} into 2 halves: part 1 ({dur1:.1f}s, {os.path.getsize(p1)/(1024*1024):.1f}MB), part 2 ({dur2:.1f}s, {os.path.getsize(p2)/(1024*1024):.1f}MB)")
             return [p1, p2]
+        else:
+            logger.warning(f"[split_halves] ffmpeg failed: proc1={proc1.returncode}, proc2={proc2.returncode}, err={proc2.stderr[:200]}")
     except Exception as e:
         logger.error(f"[split_halves] Error splitting into halves: {e}")
 
@@ -1921,25 +1958,29 @@ def get_x_media(url: str) -> tuple[dict, list]:
                             if "pbs.twimg.com/media/" in u and "name=" not in u:
                                 u = f"{u}?name=orig"
                             media_urls.append(u)
-                    # Videos (select target quality, default 720p)
+                    # Videos (select target quality, max 720p)
                     target_q = get_target_quality()
                     for v in media.get("videos", []):
                         fmts = v.get("formats", [])
+                        chosen = ""
                         if fmts:
                             chosen = choose_twitter_video_url(fmts, target_q)
-                            if chosen and chosen not in media_urls:
-                                media_urls.append(chosen)
-                                continue
-                        u = v.get("url")
-                        if u and u not in media_urls:
-                            media_urls.append(u)
-                    # All (fallback)
-                    for a in media.get("all", []):
-                        u = a.get("url")
-                        if u and u not in media_urls:
-                            if "pbs.twimg.com/media/" in u and "name=" not in u:
-                                u = f"{u}?name=orig"
-                            media_urls.append(u)
+                        if not chosen:
+                            direct_u = v.get("url", "")
+                            if direct_u and ".m3u8" not in direct_u:
+                                chosen = direct_u
+                        if chosen and chosen not in media_urls:
+                            media_urls.append(chosen)
+
+                    # Only fallback to 'all' if NEITHER photos NOR videos produced anything
+                    # (Prevents sending the same video twice since 'all' duplicates videos in other resolutions)
+                    if not media_urls:
+                        for a in media.get("all", []):
+                            u = a.get("url")
+                            if u and u not in media_urls:
+                                if "pbs.twimg.com/media/" in u and "name=" not in u:
+                                    u = f"{u}?name=orig"
+                                media_urls.append(u)
                     if media_urls:
                         logger.info(f"FxTwitter API found {len(media_urls)} media URL(s) for tweet {tweet_id}")
                         return info, media_urls
@@ -1980,13 +2021,14 @@ def get_x_media(url: str) -> tuple[dict, list]:
                         variants = media.get("video_info", {}).get("variants", [])
                         target_q = get_target_quality()
                         chosen = choose_twitter_video_url(variants, target_q)
+                        if not chosen and variants:
+                            for v in variants:
+                                u = v.get("url", "")
+                                if u and ".m3u8" not in u:
+                                    chosen = u
+                                    break
                         if chosen and chosen not in media_urls:
                             media_urls.append(chosen)
-                        else:
-                            for v in variants:
-                                if v.get("url") and v["url"] not in media_urls:
-                                    media_urls.append(v["url"])
-                                    break
         if media_urls:
             logger.info(f"Syndication API found {len(media_urls)} media URL(s) for tweet {tweet_id}")
             return info, media_urls
@@ -4034,6 +4076,12 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
             await safe_edit(status_msg, f"⬆️ تجهيز {len(file_paths)} ملف للرفع...")
 
             file_paths = [str(fix_media_file_extension(Path(fp))) for fp in file_paths if os.path.exists(fp)]
+            # Deduplicate paths to strictly avoid sending the same video twice
+            dedup_paths = []
+            for fp in file_paths:
+                if fp not in dedup_paths:
+                    dedup_paths.append(fp)
+            file_paths = dedup_paths
             photos = [fp for fp in file_paths if fp.lower().endswith(IMAGE_EXTS)]
             videos = [fp for fp in file_paths if fp.lower().endswith(VIDEO_EXTS)]
             prepared_items = []
@@ -4065,12 +4113,14 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
                 if use_local:
                     if file_mb > 1000.0:
                         # Video > 1GB: Losslessly split into 2 halves for fast, seamless upload and mobile viewing
-                        await safe_edit(status_msg, f"✂️ حجم الفيديو ({file_mb:.1f}MB > 1GB) — جاري تقسيمه لنصفين بجودته الأصلية 100% لإرسال أسرع وأخف...")
+                        await safe_edit(status_msg, f"✂️ حجم الفيديو ({file_mb:.1f}MB > 1GB) — جاري تقسيمه لنصفين متساويين بجودته الأصلية 100% بدون أي ضغط...")
                         parts = await loop.run_in_executor(None, split_video_into_halves, video_path, req_dir)
                         if parts:
                             if len(parts) > 1:
                                 for p_idx, p in enumerate(parts, 1):
-                                    p_cap = f"{caption}\n\n📦 جزء {p_idx} من {len(parts)}" if caption else f"📦 جزء {p_idx} من {len(parts)}"
+                                    half_name = "النصف الأول" if p_idx == 1 else "النصف الثاني"
+                                    part_info = f"📦 جزء {p_idx} من {len(parts)} ({half_name})"
+                                    p_cap = f"{caption}\n\n{part_info}" if caption else part_info
                                     prepared_items.append((p, "video", p_cap))
                             else:
                                 prepared_items.append((parts[0], "video"))
@@ -4323,7 +4373,7 @@ def main():
     application.add_handler(CallbackQueryHandler(cancel_button))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.FORWARDED, handle_url))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.FORWARDED, handle_url))
 
     start_health_check_server()
     logger.info("Bot started")
