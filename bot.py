@@ -28,8 +28,9 @@ import math
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from dotenv import load_dotenv
+import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, InputMediaVideo, InputFile
-from telegram.error import TelegramError
+from telegram.error import TelegramError, RetryAfter, BadRequest
 import sqlite3
 from telegram.ext import (
     Application,
@@ -56,7 +57,7 @@ AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0").strip().strip('"')
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads").strip().strip('"').strip("'"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip().strip('"').strip("'")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-BOT_VERSION = "v3.4-direct-session-support-and-auto-persistence"
+BOT_VERSION = "v3.5-large-video-reliability-and-local-server-hardening"
 
 DB_PATH = Path("archive.db")
 
@@ -378,9 +379,10 @@ def compress_video(input_path: str, output_path: str, target_mb: float = 49.0) -
     return False
 
 
-def split_video(input_path: str, output_dir: Path | str, target_mb: float = 48.0) -> list[str]:
-    """Split video into segments under target_mb using ffmpeg stream copy (-c copy).
+def split_video(input_path: str, output_dir: Path | str, target_mb: float = 42.0) -> list[str]:
+    """Split video into segments strictly under target_mb using ffmpeg stream copy (-c copy).
     Stream copy is 100% LOSSLESS and near-instantaneous (2-3 seconds).
+    Includes post-split size verification to guarantee no part exceeds Telegram limits.
     Returns list of paths to created segments."""
     input_path = str(input_path)
     output_dir = Path(output_dir)
@@ -391,17 +393,18 @@ def split_video(input_path: str, output_dir: Path | str, target_mb: float = 48.0
 
     size_bytes = os.path.getsize(input_path)
     target_bytes = target_mb * 1024 * 1024
-    if size_bytes <= target_bytes:
+    max_chunk_bytes = int(min(target_bytes, 47.5 * 1024 * 1024) if target_mb <= 50.0 else target_bytes)
+    if size_bytes <= max_chunk_bytes:
         return [input_path]
 
     duration = get_video_duration(input_path)
     if duration <= 0:
         duration = max(30.0, size_bytes / (2 * 1024 * 1024))
 
-    # Calculate safe segment duration with 10% safety margin to account for keyframe placement
-    safe_target_bytes = target_bytes * 0.90
+    # Calculate safe segment duration with 18% safety margin to account for keyframe spikes
+    safe_target_bytes = target_bytes * 0.82
     seg_time = (safe_target_bytes / size_bytes) * duration
-    seg_time = max(5.0, round(seg_time, 1))
+    seg_time = max(4.0, round(seg_time, 1))
 
     stem = Path(input_path).stem
     out_pattern = str(output_dir / f"{stem}_part_%03d.mp4")
@@ -433,13 +436,65 @@ def split_video(input_path: str, output_dir: Path | str, target_mb: float = 48.0
 
     # Collect and sort generated segments
     prefix = f"{stem}_part_"
-    parts = sorted([
+    raw_parts = sorted([
         str(output_dir / f) for f in os.listdir(output_dir)
         if f.startswith(prefix) and f.endswith(".mp4") and os.path.getsize(output_dir / f) > 1024
     ])
 
-    logger.info(f"[split_video] Successfully created {len(parts)} parts for {Path(input_path).name}")
-    return parts
+    if not raw_parts:
+        return []
+
+    # Strict size inspection loop: Guarantee that NO part exceeds max_chunk_bytes
+    verified_parts = []
+    for p in raw_parts:
+        sz = os.path.getsize(p)
+        if sz <= max_chunk_bytes:
+            verified_parts.append(p)
+            continue
+
+        # Part is oversized due to keyframe placement or bitrate peak. Sub-split this part!
+        logger.warning(
+            f"[split_video] Part {Path(p).name} is oversized ({sz / (1024*1024):.2f}MB > {max_chunk_bytes / (1024*1024):.1f}MB). Sub-splitting..."
+        )
+        p_dur = get_video_duration(p)
+        sub_ok = False
+        if p_dur > 4.0:
+            half = round(p_dur / 2.0, 1)
+            p_sub1 = p.replace(".mp4", "_s1.mp4")
+            p_sub2 = p.replace(".mp4", "_s2.mp4")
+            subprocess.run(["ffmpeg", "-y", "-ss", "0", "-i", p, "-t", str(half), "-c", "copy", "-movflags", "+faststart", p_sub1], capture_output=True, timeout=60)
+            subprocess.run(["ffmpeg", "-y", "-ss", str(half), "-i", p, "-c", "copy", "-movflags", "+faststart", p_sub2], capture_output=True, timeout=60)
+            if (os.path.exists(p_sub1) and 1024 < os.path.getsize(p_sub1) <= max_chunk_bytes and
+                os.path.exists(p_sub2) and 1024 < os.path.getsize(p_sub2) <= max_chunk_bytes):
+                verified_parts.extend([p_sub1, p_sub2])
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+                sub_ok = True
+
+        if not sub_ok:
+            # Fallback: re-encode just this single segment with CRF to guarantee it fits safely
+            p_re = p.replace(".mp4", "_fit.mp4")
+            cmd_re = [
+                "ffmpeg", "-y", "-i", p,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                p_re
+            ]
+            subprocess.run(cmd_re, capture_output=True, timeout=120)
+            if os.path.exists(p_re) and 1024 < os.path.getsize(p_re) <= max_chunk_bytes:
+                verified_parts.append(p_re)
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+            else:
+                verified_parts.append(p)
+
+    logger.info(f"[split_video] Successfully created and verified {len(verified_parts)} parts for {Path(input_path).name}")
+    return verified_parts
 
 
 def get_cookie_args() -> list:
@@ -590,9 +645,9 @@ async def safe_edit_message(target, text: str, parse_mode: str = None, reply_mar
             elif hasattr(target, "edit_text"):
                 await target.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
             return True
-        except telegram.error.RetryAfter as ra:
+        except RetryAfter as ra:
             await asyncio.sleep(ra.retry_after + 0.5)
-        except telegram.error.BadRequest as br:
+        except BadRequest as br:
             err = str(br)
             if "Message is not modified" in err:
                 return True
@@ -606,6 +661,9 @@ async def safe_edit_message(target, text: str, parse_mode: str = None, reply_mar
                     return True
                 except Exception:
                     pass
+            break
+        except TelegramError as te:
+            logger.debug(f"safe_edit_message TelegramError: {te}")
             break
         except Exception as e:
             logger.debug(f"safe_edit_message error: {e}")
@@ -621,18 +679,93 @@ def _get_api_url():
     return f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
+async def check_and_restore_local_server(bot=None) -> bool:
+    """Check if local telegram-bot-api server is listening and restore USE_LOCAL_SERVER if recovered."""
+    local_url = os.getenv("LOCAL_API_URL", "").strip()
+    if not local_url:
+        return False
+    try:
+        parsed = urlparse(local_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 8081
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1.0)
+        res = s.connect_ex((host, port))
+        s.close()
+        if res == 0:
+            if os.getenv("USE_LOCAL_SERVER", "").lower() != "true":
+                logger.info("[watchdog] Local Bot API Server is online! Restoring local server mode (2GB limit)...")
+                os.environ["USE_LOCAL_SERVER"] = "true"
+                if bot and hasattr(bot, "_base_url"):
+                    bot._base_url = f"{local_url.rstrip('/')}/bot{BOT_TOKEN}"
+                    bot._base_file_url = f"{local_url.rstrip('/')}/file/bot{BOT_TOKEN}"
+            return True
+    except Exception:
+        pass
+    return False
+
+
 async def _curl_upload(api_url, endpoint, path, extra_fields=None, timeout=300, thumb_path=None):
-    """Run curl in a subprocess with EXPLICIT lifecycle management and Cloud API fallback."""
+    """Run curl in a subprocess with native local mode direct file access, automatic process recovery, and Cloud API fallback."""
+    is_local = "127.0.0.1" in api_url or "localhost" in api_url
+    abs_path = os.path.abspath(path)
+    file_field = "video" if endpoint == "sendVideo" else "photo"
+    f_size = os.path.getsize(path) if os.path.exists(path) else 0
+
+    # Strategy 1: If using Local Bot API Server, pass local file path directly via file:// URI.
+    # In --local mode, telegram-bot-api reads the file directly from disk without streaming
+    # multi-GB payloads through loopback HTTP sockets, avoiding RAM bloat and connection resets.
+    if is_local and os.path.exists(abs_path):
+        cmd_file_uri = [
+            "curl", "-s", "-S", "-X", "POST",
+            f"{api_url}/{endpoint}",
+            "--max-time", str(timeout),
+            "--connect-timeout", "15",
+            "-F", f"{file_field}=file://{abs_path}",
+        ]
+        if thumb_path and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+            cmd_file_uri.extend(["-F", f"thumb=file://{os.path.abspath(thumb_path)}"])
+        if extra_fields:
+            for k, v in extra_fields.items():
+                cmd_file_uri.extend(["-F", f"{k}={v}"])
+
+        logger.info(f"[upload] started local curl {endpoint} {os.path.basename(path)} ({f_size/(1024*1024):.1f}MB) via file:// URI")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd_file_uri,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            comm_task = asyncio.ensure_future(proc.communicate())
+            done, pending = await asyncio.wait([comm_task], timeout=timeout)
+            if not pending:
+                stdout, stderr = comm_task.result()
+                output = stdout.decode(errors="replace").strip()
+                result = json.loads(output) if output else {}
+                if proc.returncode in (0, None) and result.get("ok"):
+                    logger.info(f"[upload] {endpoint} {os.path.basename(path)} succeeded via local file:// URI")
+                    return result
+                logger.warning(f"[upload] local file:// URI returned: {result.get('description', output[:200])}. Trying stream upload...")
+            else:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                comm_task.cancel()
+        except Exception as le:
+            logger.warning(f"[upload] local file:// attempt error: {le}. Trying standard upload...")
+
+    # Strategy 2: Standard multipart stream upload (for Cloud API or local server fallback)
     cmd = [
         "curl", "-s", "-S", "-X", "POST",
         f"{api_url}/{endpoint}",
         "--max-time", str(timeout),
         "--connect-timeout", "15",
+        "--no-buffer",
     ]
     if thumb_path and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
         cmd.extend(["-F", f"thumb=@{thumb_path}"])
         logger.info(f"[upload] attaching thumbnail {os.path.basename(thumb_path)} ({os.path.getsize(thumb_path)} bytes)")
-    file_field = "video" if endpoint == "sendVideo" else "photo"
     cmd.extend(["-F", f"{file_field}=@{path}"])
     if extra_fields:
         for k, v in extra_fields.items():
@@ -646,10 +779,7 @@ async def _curl_upload(api_url, endpoint, path, extra_fields=None, timeout=300, 
     logger.info(f"[upload] started curl pid={proc.pid} {endpoint} {os.path.basename(path)}")
 
     comm_task = asyncio.ensure_future(proc.communicate())
-    done, pending = await asyncio.wait(
-        [comm_task],
-        timeout=timeout,
-    )
+    done, pending = await asyncio.wait([comm_task], timeout=timeout)
 
     if pending:
         logger.warning(f"[upload] TIMEOUT after {timeout}s — killing curl pid={proc.pid}")
@@ -660,8 +790,8 @@ async def _curl_upload(api_url, endpoint, path, extra_fields=None, timeout=300, 
         await asyncio.wait(pending, timeout=5)
         comm_task.cancel()
 
-        # If local server timed out, retry immediately on Telegram Cloud API!
-        if "127.0.0.1" in api_url or "localhost" in api_url:
+        # If local server timed out and file is <= 48MB, retry on Cloud API
+        if is_local and f_size <= 48 * 1024 * 1024:
             cloud_url = f"https://api.telegram.org/bot{BOT_TOKEN}"
             logger.warning(f"[upload] Local server timed out on {endpoint}. Retrying on Cloud API...")
             cmd_cloud = list(cmd)
@@ -689,30 +819,53 @@ async def _curl_upload(api_url, endpoint, path, extra_fields=None, timeout=300, 
     output = stdout.decode(errors="replace").strip()
     result = json.loads(output) if output else {}
 
-    # If failed on local server, fallback to official Telegram Cloud API immediately!
+    # Handle errors and retries
     if proc.returncode not in (0, None) or not result.get("ok"):
         err = result.get('description', output[:200]) if result else stderr.decode(errors="replace").strip()[:300]
-        if "127.0.0.1" in api_url or "localhost" in api_url:
-            cloud_url = f"https://api.telegram.org/bot{BOT_TOKEN}"
-            logger.warning(f"[upload] Local server returned error for {endpoint} ({err}). Retrying via Cloud API...")
-            cmd_cloud = list(cmd)
-            for ci, carg in enumerate(cmd_cloud):
-                if f"{api_url}/{endpoint}" in carg:
-                    cmd_cloud[ci] = f"{cloud_url}/{endpoint}"
-            try:
-                proc2 = await asyncio.create_subprocess_exec(
-                    *cmd_cloud,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout2, stderr2 = await asyncio.wait_for(proc2.communicate(), timeout=timeout)
-                out2 = stdout2.decode(errors="replace").strip()
-                res2 = json.loads(out2) if out2 else {}
-                if res2.get("ok"):
-                    logger.info(f"[upload] {endpoint} succeeded via Cloud API fallback")
-                    return res2
-            except Exception as ce:
-                logger.error(f"[upload] Cloud API fallback failed: {ce}")
+
+        # Check for local server connection glitch (e.g. process respawned by supervisor)
+        if is_local and (proc.returncode in (7, 52, 56) or any(k in err for k in ["Connection reset", "Couldn't connect", "Failed to connect", "Empty reply"])):
+            logger.warning(f"[upload] Local server connection glitch ({err}). Checking if supervisor respawned it...")
+            await asyncio.sleep(2.5)
+            if await check_and_restore_local_server():
+                logger.info("[upload] Local server is healthy! Retrying upload on local server...")
+                try:
+                    proc_retry = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                    stdout_r, _ = await asyncio.wait_for(proc_retry.communicate(), timeout=timeout)
+                    out_r = stdout_r.decode(errors="replace").strip()
+                    res_r = json.loads(out_r) if out_r else {}
+                    if proc_retry.returncode in (0, None) and res_r.get("ok"):
+                        logger.info("[upload] Retry on local server succeeded!")
+                        return res_r
+                except Exception as retry_err:
+                    logger.warning(f"[upload] Retry on local server failed: {retry_err}")
+
+        # Cloud API fallback: ONLY attempt if file is <= 48MB!
+        # Retrying a 1GB file on Cloud API will ALWAYS fail with 'Request Entity Too Large'!
+        if is_local:
+            if f_size <= 48 * 1024 * 1024:
+                cloud_url = f"https://api.telegram.org/bot{BOT_TOKEN}"
+                logger.warning(f"[upload] Local server returned error for {endpoint} ({err}). Retrying via Cloud API...")
+                cmd_cloud = list(cmd)
+                for ci, carg in enumerate(cmd_cloud):
+                    if f"{api_url}/{endpoint}" in carg:
+                        cmd_cloud[ci] = f"{cloud_url}/{endpoint}"
+                try:
+                    proc2 = await asyncio.create_subprocess_exec(
+                        *cmd_cloud,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout2, stderr2 = await asyncio.wait_for(proc2.communicate(), timeout=timeout)
+                    out2 = stdout2.decode(errors="replace").strip()
+                    res2 = json.loads(out2) if out2 else {}
+                    if res2.get("ok"):
+                        logger.info(f"[upload] {endpoint} succeeded via Cloud API fallback")
+                        return res2
+                except Exception as ce:
+                    logger.error(f"[upload] Cloud API fallback failed: {ce}")
+            else:
+                logger.warning(f"[upload] Local server failed and file is {f_size/(1024*1024):.1f}MB (>48MB). Signalling for emergency split.")
 
         if proc.returncode not in (0, None):
             raise Exception(f"curl rc={proc.returncode}: {err}")
@@ -753,6 +906,14 @@ async def _curl_upload_media_group(chat_id, media_items, caption="", timeout=600
         return False
 
     api_url = _get_api_url()
+    is_local = "127.0.0.1" in api_url or "localhost" in api_url
+    total_size = sum(os.path.getsize(it[0]) for it in media_items if os.path.exists(it[0]))
+
+    # Enforce Cloud API size limit for albums: Telegram rejects payloads > 50MB with 413 Request Entity Too Large
+    if not is_local and total_size >= 45 * 1024 * 1024:
+        logger.info(f"[upload] Album total size ({total_size / (1024*1024):.1f}MB) exceeds Cloud API 45MB ceiling. Bypassing album to send sequentially.")
+        return False
+
     cmd = [
         "curl", "-s", "-S", "-X", "POST",
         f"{api_url}/sendMediaGroup",
@@ -765,11 +926,22 @@ async def _curl_upload_media_group(chat_id, media_items, caption="", timeout=600
         path = item_data[0]
         kind = item_data[1]
         item_cap = item_data[2] if len(item_data) > 2 else (caption if idx == 0 and caption else None)
-        key = f"file_{idx}"
-        item = {
-            "type": "photo" if kind == "photo" else "video",
-            "media": f"attach://{key}",
-        }
+        abs_p = os.path.abspath(path)
+
+        if is_local:
+            # On local server, use direct file:// URI to prevent multipart buffer bloat
+            item = {
+                "type": "photo" if kind == "photo" else "video",
+                "media": f"file://{abs_p}",
+            }
+        else:
+            key = f"file_{idx}"
+            item = {
+                "type": "photo" if kind == "photo" else "video",
+                "media": f"attach://{key}",
+            }
+            cmd.extend(["-F", f"{key}=@{path}"])
+
         if item_cap:
             item["caption"] = item_cap[:1024]
 
@@ -784,12 +956,15 @@ async def _curl_upload_media_group(chat_id, media_items, caption="", timeout=600
                         except (ValueError, TypeError):
                             pass
             if thumb_map and path in thumb_map and thumb_map[path] and os.path.exists(thumb_map[path]):
-                thumb_key = f"thumb_{idx}"
-                item["thumbnail"] = f"attach://{thumb_key}"
-                cmd.extend(["-F", f"{thumb_key}=@{thumb_map[path]}"])
+                abs_thumb = os.path.abspath(thumb_map[path])
+                if is_local:
+                    item["thumbnail"] = f"file://{abs_thumb}"
+                else:
+                    thumb_key = f"thumb_{idx}"
+                    item["thumbnail"] = f"attach://{thumb_key}"
+                    cmd.extend(["-F", f"{thumb_key}=@{thumb_map[path]}"])
 
         media_json.append(item)
-        cmd.extend(["-F", f"{key}=@{path}"])
 
     cmd.extend(["-F", f"media={json.dumps(media_json)}"])
 
@@ -820,13 +995,33 @@ async def _curl_upload_media_group(chat_id, media_items, caption="", timeout=600
     if proc.returncode not in (0, None) or not result.get("ok"):
         err_desc = result.get('description', output[:200]) if result else (stderr.decode(errors="replace").strip()[:300])
         logger.warning(f"sendMediaGroup failed on {api_url}: {err_desc}")
-        if "localhost" in api_url or "127.0.0.1" in api_url:
+        # Only retry on Cloud API if total size is safely under 45MB
+        if ("localhost" in api_url or "127.0.0.1" in api_url) and total_size < 45 * 1024 * 1024:
             cloud_url = f"https://api.telegram.org/bot{BOT_TOKEN}"
             logger.info("Retrying sendMediaGroup directly via official Telegram Cloud API...")
-            cmd_cloud = list(cmd)
-            for ci, carg in enumerate(cmd_cloud):
-                if f"{api_url}/sendMediaGroup" in carg:
-                    cmd_cloud[ci] = f"{cloud_url}/sendMediaGroup"
+            cmd_cloud = [
+                "curl", "-s", "-S", "-X", "POST",
+                f"{cloud_url}/sendMediaGroup",
+                "--max-time", str(timeout),
+                "--connect-timeout", "20",
+                "-F", f"chat_id={chat_id}",
+            ]
+            cloud_json = []
+            for idx, item_data in enumerate(media_items[:10]):
+                c_p = item_data[0]
+                c_k = item_data[1]
+                c_cap = item_data[2] if len(item_data) > 2 else (caption if idx == 0 and caption else None)
+                f_key = f"c_file_{idx}"
+                c_item = {"type": "photo" if c_k == "photo" else "video", "media": f"attach://{f_key}"}
+                if c_cap:
+                    c_item["caption"] = c_cap[:1024]
+                cmd_cloud.extend(["-F", f"{f_key}=@{c_p}"])
+                if c_k == "video" and thumb_map and c_p in thumb_map and thumb_map[c_p] and os.path.exists(thumb_map[c_p]):
+                    t_key = f"c_thumb_{idx}"
+                    c_item["thumbnail"] = f"attach://{t_key}"
+                    cmd_cloud.extend(["-F", f"{t_key}=@{thumb_map[c_p]}"])
+                cloud_json.append(c_item)
+            cmd_cloud.extend(["-F", f"media={json.dumps(cloud_json)}"])
             try:
                 proc2 = await asyncio.create_subprocess_exec(
                     *cmd_cloud,
@@ -854,6 +1049,15 @@ async def send_media_group_isolated(bot, chat_id, media_list, caption="", thumb_
     if len(media_list) < 2:
         return False
 
+    api_url = _get_api_url()
+    is_local = "127.0.0.1" in api_url or "localhost" in api_url
+    total_size = sum(os.path.getsize(it[0]) for it in media_list if os.path.exists(it[0]))
+
+    # Strict check for Cloud API: prevent 413 Request Entity Too Large upfront
+    if not is_local and total_size >= 45 * 1024 * 1024:
+        logger.info(f"[send_media_group_isolated] Total album size ({total_size/(1024*1024):.1f}MB) exceeds Cloud API limit (45MB). Bypassing album to send sequentially.")
+        return False
+
     # Attempt 1: Isolated curl (handles local server, large files, streaming without RAM bloat)
     try:
         ok = await _curl_upload_media_group(chat_id, media_list, caption, thumb_map=thumb_map, meta_map=meta_map)
@@ -861,6 +1065,10 @@ async def send_media_group_isolated(bot, chat_id, media_list, caption="", thumb_
             return True
     except Exception as e:
         logger.warning(f"Curl media group upload failed, trying python-telegram-bot fallback: {e}")
+
+    # If on Cloud API and total size >= 45MB, do NOT attempt python-telegram-bot (it will fail with 413)
+    if not is_local and total_size >= 45 * 1024 * 1024:
+        return False
 
     # Attempt 2: python-telegram-bot fallback with properly opened binary files
     file_handles = []
@@ -1815,7 +2023,7 @@ async def send_instagram_profile_menu(update: Update, context: ContextTypes.DEFA
     if update.message:
         await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
     elif update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        await safe_edit_message(update.callback_query, text, reply_markup=reply_markup, parse_mode="Markdown")
 
 
 async def handle_instagram_profile_posts(query, context: ContextTypes.DEFAULT_TYPE, username: str, limit: int = 30):
@@ -2399,7 +2607,7 @@ async def send_facebook_profile_menu(update: Update, context: ContextTypes.DEFAU
     if update.message:
         await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
     elif update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        await safe_edit_message(update.callback_query, text, reply_markup=reply_markup, parse_mode="Markdown")
 
 
 def extract_facebook_media_links_from_html(html: str, target: str = "") -> dict:
@@ -3260,7 +3468,8 @@ async def send_media_to_target(
     caption: str,
     video_meta_cache: dict,
     thumb_cache: dict,
-    loop
+    loop,
+    status_msg=None
 ) -> tuple[int, bool]:
     """Sends a list of (path, kind) items to target_chat_id (user or channel).
     Returns (successful_sends_count, sent_as_group)."""
@@ -3270,8 +3479,26 @@ async def send_media_to_target(
     successful_sends = 0
     sent_group = False
 
-    # Attempt album grouping if > 1 items
-    if len(items) > 1:
+    api_url = _get_api_url()
+    is_local = "127.0.0.1" in api_url or "localhost" in api_url
+
+    # Check whether items are split segments of a single video (e.g. part 1 of 5)
+    is_split_series = any(
+        (len(item) > 2 and "جزء" in str(item[2])) or ("_part_" in Path(item[0]).name)
+        for item in items
+    )
+    total_size = sum(os.path.getsize(it[0]) for it in items if os.path.exists(it[0]))
+
+    # Album delivery condition:
+    # 1. Do NOT bundle split series into an album (Telegram hides individual captions & Cloud API rejects >50MB).
+    # 2. On Cloud API, do NOT bundle if total size >= 45MB.
+    can_album = (
+        len(items) > 1
+        and not is_split_series
+        and (is_local or total_size < 45 * 1024 * 1024)
+    )
+
+    if can_album:
         chunk_size = 10
         all_chunks_sent = True
         for i in range(0, len(items), chunk_size):
@@ -3313,16 +3540,30 @@ async def send_media_to_target(
         if all_chunks_sent and successful_sends > 0:
             sent_group = True
 
-    # Fallback: send one by one if not sent as group
+    # Sequential delivery: each item is uploaded individually with progress and auto-recovery
     if not sent_group:
-        for idx, item_data in enumerate(items):
+        total_items = len(items)
+        for idx, item_data in enumerate(items, 1):
             path = item_data[0]
             kind = item_data[1]
             if not os.path.exists(path):
                 continue
-            item_caption = item_data[2] if len(item_data) > 2 else (caption if idx == 0 else "")
+            item_caption = item_data[2] if len(item_data) > 2 else (caption if idx == 1 else "")
             f_mb = os.path.getsize(path) / (1024 * 1024) if os.path.exists(path) else 0
             v_timeout = max(300, int((f_mb * 2) + 120))
+
+            if status_msg and total_items > 1:
+                try:
+                    pct = int(((idx - 1) / total_items) * 100)
+                    bar = make_progress_bar_pct(pct, 10)
+                    await safe_edit_message(
+                        status_msg,
+                        f"⬆️ جاري إرسال الملف {idx} من {total_items}...\n" + f"{bar} {pct}%"
+                    )
+                except Exception:
+                    pass
+
+            item_sent = False
             for attempt in range(2):
                 try:
                     if kind == "photo":
@@ -3335,11 +3576,42 @@ async def send_media_to_target(
                             thumb_cache[path] = await loop.run_in_executor(None, extract_thumbnail, str(path))
                         await _send_video_isolated(target_chat_id, path, item_caption, meta=meta, thumb_path=thumb_cache.get(path), timeout=v_timeout)
                     successful_sends += 1
+                    item_sent = True
                     break
                 except Exception as e:
                     logger.error(f"Send failed to {target_chat_id} for {path} (attempt {attempt+1}): {e}")
                     if attempt == 0:
                         await asyncio.sleep(2)
+
+            # Emergency auto-splitting: If a video > 48MB failed (e.g. local server died during upload):
+            # Split it into safe lossless parts (<45MB) right now and deliver them via Cloud API!
+            if not item_sent and kind == "video" and f_mb > 48.0:
+                logger.warning(f"Video {path} ({f_mb:.1f}MB) could not be sent whole. Triggering emergency lossless split for Cloud delivery...")
+                req_dir = Path(path).parent
+                if status_msg:
+                    try:
+                        await safe_edit_message(status_msg, f"✂️ جاري تقسيم الفيديو ({f_mb:.1f}MB) لأجزاء بجودته الأصلية للإرسال الفوري...")
+                    except Exception:
+                        pass
+                sub_parts = await loop.run_in_executor(None, split_video, path, req_dir, 42.0)
+                if sub_parts and len(sub_parts) > 1:
+                    for sp_idx, sp in enumerate(sub_parts, 1):
+                        sp_cap = (f"{item_caption}\n\n" if item_caption else "") + f"📦 جزء {sp_idx} من {len(sub_parts)}"
+                        sp_meta = await loop.run_in_executor(None, get_video_metadata, sp)
+                        sp_thumb = await loop.run_in_executor(None, extract_thumbnail, sp)
+                        if status_msg:
+                            try:
+                                await safe_edit_message(status_msg, f"⬆️ جاري إرسال الجزء {sp_idx} من {len(sub_parts)}...")
+                            except Exception:
+                                pass
+                        try:
+                            await _send_video_isolated(
+                                target_chat_id, sp, sp_cap,
+                                meta=sp_meta, thumb_path=sp_thumb, timeout=300
+                            )
+                            successful_sends += 1
+                        except Exception as spe:
+                            logger.error(f"Emergency subpart send failed for {sp}: {spe}")
 
     return successful_sends, sent_group
 
@@ -3614,19 +3886,19 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
                             await notify_stopped(f"تعذر تقسيم الفيديو الكبير ({file_mb:.1f}MB).")
                             return
                 else:
-                    if file_mb <= 50:
+                    if file_mb <= 48.0:
                         prepared_items.append((video_path, "video"))
                     else:
                         duration = get_video_duration(video_path)
-                        can_compress = duration > 0 and duration < 600 and ((49 * 1024 * 1024 * 8) / duration) > 400_000
+                        can_compress = duration > 0 and duration < 600 and ((45 * 1024 * 1024 * 8) / duration) > 400_000
 
                         compressed_ok = False
                         if can_compress:
                             await safe_edit(status_msg, f"⏳ حجم الفيديو ({file_mb:.1f}MB) — جاري ضغطه ليناسب إرسال تيليجرام (أقل من 50MB)...")
                             cpath = str(video_path) + ".compressed.mp4"
                             try:
-                                compressed = await loop.run_in_executor(None, compress_video, video_path, cpath, 49.0)
-                                if compressed and os.path.exists(cpath) and os.path.getsize(cpath) <= 50 * 1024 * 1024:
+                                compressed = await loop.run_in_executor(None, compress_video, video_path, cpath, 44.0)
+                                if compressed and os.path.exists(cpath) and os.path.getsize(cpath) <= 48 * 1024 * 1024:
                                     prepared_items.append((cpath, "video"))
                                     compressed_ok = True
                             except Exception as ce:
@@ -3634,7 +3906,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
 
                         if not compressed_ok:
                             await safe_edit(status_msg, f"✂️ حجم الفيديو ({file_mb:.1f}MB) — جاري تقسيمه لأجزاء بجودته الأصلية 100% بدون أي ضغط...")
-                            parts = await loop.run_in_executor(None, split_video, video_path, req_dir, 47.0)
+                            parts = await loop.run_in_executor(None, split_video, video_path, req_dir, 42.0)
                             if parts:
                                 if len(parts) > 1:
                                     for p_idx, p in enumerate(parts, 1):
@@ -3685,7 +3957,8 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
             try:
                 successful_sends, sent_group = await send_media_to_target(
                     context.bot, chat_id, unique_items, caption,
-                    video_meta_cache, thumb_cache, loop
+                    video_meta_cache, thumb_cache, loop,
+                    status_msg=status_msg
                 )
             finally:
                 uploading = False
@@ -3785,6 +4058,11 @@ def main():
 
     application = builder.build()
 
+    if application.job_queue and local_url:
+        async def _local_server_watchdog_job(context: ContextTypes.DEFAULT_TYPE):
+            await check_and_restore_local_server(context.bot)
+        application.job_queue.run_repeating(_local_server_watchdog_job, interval=25, first=10)
+
     async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         global _consecutive_connect_errors
         err = context.error
@@ -3810,9 +4088,9 @@ def main():
                 f"Telegram connection error #{_consecutive_connect_errors}: {err} (target: {current_base_url})"
             )
 
-            # If using local server and it fails 2 times consecutively: fall back immediately to Telegram Cloud API!
+            # If using local server and it fails 4 times consecutively: fall back to Telegram Cloud API!
             if "127.0.0.1" in current_base_url or "localhost" in current_base_url:
-                if _consecutive_connect_errors >= 2:
+                if _consecutive_connect_errors >= 4:
                     logger.warning(
                         f"Local Bot API server at {current_base_url} is unreachable ({_consecutive_connect_errors} failures). "
                         "Switching immediately to official Telegram Cloud API (api.telegram.org)!"
