@@ -57,7 +57,7 @@ AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0").strip().strip('"')
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads").strip().strip('"').strip("'"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip().strip('"').strip("'")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-BOT_VERSION = "v3.5-large-video-reliability-and-local-server-hardening"
+BOT_VERSION = "v3.6-720p-default-quality-and-smart-1gb-half-splitting"
 
 DB_PATH = Path("archive.db")
 
@@ -89,10 +89,36 @@ def init_db():
             conn.execute("""
                 INSERT OR IGNORE INTO settings (key, value) VALUES ('archive_channel_title', 'SD')
             """)
+            conn.execute("""
+                INSERT OR IGNORE INTO settings (key, value) VALUES ('target_quality', '720')
+            """)
             conn.commit()
             logger.info("Archive database initialized successfully with default channel SD (-1004482083833)")
     except Exception as e:
         logger.error(f"init_db failed: {e}")
+
+def get_target_quality() -> str:
+    """Returns preferred download quality ('720', '1080', '480', 'best'). Default is '720'."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.execute("SELECT value FROM settings WHERE key = 'target_quality'")
+            row = cur.fetchone()
+            if row and row[0]:
+                return row[0].strip()
+    except Exception:
+        pass
+    return "720"
+
+
+def set_target_quality(quality: str):
+    """Save preferred download quality to settings."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('target_quality', ?)", (quality.strip(),))
+            conn.commit()
+            logger.info(f"Target quality set to: {quality}")
+    except Exception as e:
+        logger.error(f"set_target_quality error: {e}")
 
 def get_canonical_post_id(url: str) -> tuple[str, str]:
     """Returns unique (post_id, platform_name) to reliably detect duplicates."""
@@ -495,6 +521,115 @@ def split_video(input_path: str, output_dir: Path | str, target_mb: float = 42.0
 
     logger.info(f"[split_video] Successfully created and verified {len(verified_parts)} parts for {Path(input_path).name}")
     return verified_parts
+
+def choose_twitter_video_url(formats_or_variants: list, target_quality: str = None) -> str:
+    """Selects the video URL closest to target_quality (default 720p).
+    If target is 720p: picks the highest quality <= 720p. If none <= 720p, picks the lowest > 720p."""
+    if not target_quality:
+        target_quality = get_target_quality()
+
+    mp4_items = []
+    for item in formats_or_variants:
+        url = item.get("url", "")
+        if not url or ".m3u8" in url:
+            continue
+        ct = item.get("content_type", "")
+        cont = item.get("container", "")
+        if ct and "mp4" not in ct:
+            continue
+        if cont and "mp4" not in cont:
+            continue
+
+        bitrate = item.get("bitrate", 0)
+        w = item.get("width")
+        h = item.get("height")
+        if not (w and h):
+            m = re.search(r"/(\d+)x(\d+)/", url)
+            if m:
+                w, h = int(m.group(1)), int(m.group(2))
+
+        p_val = min(w, h) if (w and h) else 0
+        mp4_items.append({"url": url, "bitrate": bitrate or 0, "p_val": p_val})
+
+    if not mp4_items:
+        return ""
+
+    if target_quality == "best":
+        mp4_items.sort(key=lambda x: (x["p_val"], x["bitrate"]), reverse=True)
+        return mp4_items[0]["url"]
+
+    target_p = 720
+    try:
+        target_p = int(target_quality.lower().replace("p", ""))
+    except Exception:
+        target_p = 720
+
+    # 1. Prefer formats <= target_p (e.g. <= 720p)
+    under_or_equal = [x for x in mp4_items if x["p_val"] > 0 and x["p_val"] <= target_p]
+    if under_or_equal:
+        under_or_equal.sort(key=lambda x: (x["p_val"], x["bitrate"]), reverse=True)
+        return under_or_equal[0]["url"]
+
+    # 2. If all formats are > target_p, pick lowest above target
+    over = [x for x in mp4_items if x["p_val"] > target_p]
+    if over:
+        over.sort(key=lambda x: (x["p_val"], x["bitrate"]))
+        return over[0]["url"]
+
+    # 3. Fallback by bitrate
+    mp4_items.sort(key=lambda x: x["bitrate"], reverse=True)
+    return mp4_items[0]["url"]
+
+
+def split_video_into_halves(input_path: str, output_dir: Path | str) -> list[str]:
+    """Split video > 1GB into 2 equal halves losslessly using ffmpeg stream copy (-c copy)."""
+    input_path = str(input_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    dur = get_video_duration(input_path)
+    if dur <= 10.0:
+        return [input_path]
+
+    half_dur = round(dur / 2.0, 2)
+    stem = Path(input_path).stem
+    p1 = str(output_dir / f"{stem}_part_001.mp4")
+    p2 = str(output_dir / f"{stem}_part_002.mp4")
+
+    logger.info(f"[split_halves] Splitting {Path(input_path).name} ({os.path.getsize(input_path)/(1024*1024):.1f}MB, {dur:.1f}s) into 2 halves at {half_dur:.1f}s")
+
+    cmd1 = [
+        "ffmpeg", "-y", "-ss", "0", "-i", input_path,
+        "-t", str(half_dur),
+        "-c", "copy",
+        "-map", "0",
+        "-reset_timestamps", "1",
+        "-movflags", "+faststart",
+        p1
+    ]
+    cmd2 = [
+        "ffmpeg", "-y", "-ss", str(half_dur), "-i", input_path,
+        "-c", "copy",
+        "-map", "0",
+        "-reset_timestamps", "1",
+        "-movflags", "+faststart",
+        p2
+    ]
+
+    try:
+        proc1 = subprocess.run(cmd1, capture_output=True, text=True, timeout=180)
+        proc2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=180)
+        if (
+            proc1.returncode == 0 and os.path.exists(p1) and os.path.getsize(p1) > 1024 and
+            proc2.returncode == 0 and os.path.exists(p2) and os.path.getsize(p2) > 1024
+        ):
+            logger.info(f"[split_halves] Successfully split {Path(input_path).name} into 2 halves: {p1} ({os.path.getsize(p1)/(1024*1024):.1f}MB), {p2} ({os.path.getsize(p2)/(1024*1024):.1f}MB)")
+            return [p1, p2]
+    except Exception as e:
+        logger.error(f"[split_halves] Error splitting into halves: {e}")
+
+    # Fallback to general splitter if direct split into halves failed
+    return split_video(input_path, output_dir, target_mb=950.0)
 
 
 def get_cookie_args() -> list:
@@ -1546,6 +1681,7 @@ def run_ytdlp_download(
 ) -> str:
     """Run yt-dlp download attempt with streaming output and timeout.
     Returns stderr text for diagnostics."""
+    target_q = get_target_quality()
     cmd_dl = [
         "yt-dlp",
         "--no-warnings",
@@ -1559,6 +1695,14 @@ def run_ytdlp_download(
         "--newline",
         "--progress-template", "download:PROGRESS %(progress._percent_str)s | %(progress._downloaded_bytes_str)s/%(progress._total_bytes_str)s | %(progress._speed_str)s | ETA %(progress._eta_str)s",
     ]
+    if target_q.isdigit():
+        cmd_dl += [
+            "-f", f"bestvideo[height<={target_q}]+bestaudio/best[height<={target_q}]/best",
+        ]
+    else:
+        cmd_dl += [
+            "-f", "bestvideo+bestaudio/best",
+        ]
     if use_cookies:
         cmd_dl += get_cookie_args()
     cmd_dl += ["-o", str(download_path / "%(autonumber)s_%(id)s.%(ext)s")]
@@ -1777,8 +1921,15 @@ def get_x_media(url: str) -> tuple[dict, list]:
                             if "pbs.twimg.com/media/" in u and "name=" not in u:
                                 u = f"{u}?name=orig"
                             media_urls.append(u)
-                    # Videos
+                    # Videos (select target quality, default 720p)
+                    target_q = get_target_quality()
                     for v in media.get("videos", []):
+                        fmts = v.get("formats", [])
+                        if fmts:
+                            chosen = choose_twitter_video_url(fmts, target_q)
+                            if chosen and chosen not in media_urls:
+                                media_urls.append(chosen)
+                                continue
                         u = v.get("url")
                         if u and u not in media_urls:
                             media_urls.append(u)
@@ -1827,13 +1978,10 @@ def get_x_media(url: str) -> tuple[dict, list]:
                                 media_urls.append(media_url)
                     elif media_type in ("video", "animated_gif"):
                         variants = media.get("video_info", {}).get("variants", [])
-                        best = None
-                        for v in variants:
-                            if v.get("content_type") == "video/mp4" and v.get("url"):
-                                if best is None or v.get("bitrate", 0) > best.get("bitrate", 0):
-                                    best = v
-                        if best and best["url"] not in media_urls:
-                            media_urls.append(best["url"])
+                        target_q = get_target_quality()
+                        chosen = choose_twitter_video_url(variants, target_q)
+                        if chosen and chosen not in media_urls:
+                            media_urls.append(chosen)
                         else:
                             for v in variants:
                                 if v.get("url") and v["url"] not in media_urls:
@@ -3192,11 +3340,45 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- Instagram posts, reels, stories\n"
         "- Facebook videos and reels\n"
         "- TikTok videos and photo albums (Photo & Video Albums 📸🎬)\n\n"
+        f"🎯 جودة التحميل الافتراضية: <b>{get_target_quality()}p HD</b> (لتغييرها: /quality)\n"
         f"🤖 الإصدار النشط: {BOT_VERSION}\n"
         f"📁 {arch_status}",
         parse_mode="HTML",
         reply_markup=start_keyboard,
     )
+
+
+
+async def quality_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show or change target video download quality (defaults to 720p)."""
+    user = update.effective_user
+    if user and not is_authorized(user.id):
+        return
+
+    current = get_target_quality()
+    keyboard = [
+        [
+            InlineKeyboardButton(f"{'✅ ' if current == '720' else ''}📺 720p HD (الافتراضي)", callback_data="quality_set_720"),
+            InlineKeyboardButton(f"{'✅ ' if current == '1080' else ''}🎬 1080p Full HD", callback_data="quality_set_1080"),
+        ],
+        [
+            InlineKeyboardButton(f"{'✅ ' if current == '480' else ''}📱 480p SD (موفر)", callback_data="quality_set_480"),
+            InlineKeyboardButton(f"{'✅ ' if current == 'best' else ''}🌟 أعلى جودة متاحة", callback_data="quality_set_best"),
+        ],
+    ]
+    markup = InlineKeyboardMarkup(keyboard)
+    quality_names = {
+        "720": "📺 720p HD (متوازن وموفر للبيانات)",
+        "1080": "🎬 1080p Full HD (أعلى وضوح وحجم أكبر)",
+        "480": "📱 480p SD (خفيف وموفر للباقة)",
+        "best": "🌟 أعلى جودة متاحة تلقائياً",
+    }
+    cur_desc = quality_names.get(current, f"{current}p")
+    text = f"⚙️ *إعدادات جودة تحميل الفيديوهات*\n\n🎯 *الجودة المعتمدة حالياً:* `{cur_desc}`\n\nاضغط على الجودة التي تريدها لتثبيتها لجميع التحميلات القادمة:"
+    if update.message:
+        await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+    elif update.callback_query:
+        await safe_edit_message(update.callback_query, text, reply_markup=markup, parse_mode="Markdown")
 
 
 async def archive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3316,6 +3498,18 @@ async def cancel_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if target == "saved" and context.user_data:
             target = context.user_data.get("last_fb_target", target)
         context.application.create_task(handle_facebook_profile_content(query, context, target, content_type="stories", limit=10))
+    elif query.data.startswith("quality_set_"):
+        new_q = query.data.replace("quality_set_", "")
+        set_target_quality(new_q)
+        quality_labels = {
+            "720": "📺 720p HD",
+            "1080": "🎬 1080p Full HD",
+            "480": "📱 480p SD",
+            "best": "🌟 أعلى جودة متاحة",
+        }
+        lbl = quality_labels.get(new_q, f"{new_q}p")
+        await query.answer(f"تم اختيار: {lbl}")
+        await quality_command(update, context)
 
 
 async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3869,12 +4063,10 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
                 file_mb = os.path.getsize(video_path) / (1024 * 1024)
 
                 if use_local:
-                    if file_mb <= 2000:
-                        await loop.run_in_executor(None, ensure_faststart, video_path)
-                        prepared_items.append((video_path, "video"))
-                    else:
-                        await safe_edit(status_msg, f"✂️ حجم الفيديو ({file_mb:.1f}MB) يتجاوز 2GB — جاري تقسيمه بجودته الأصلية...")
-                        parts = await loop.run_in_executor(None, split_video, video_path, req_dir, 1950.0)
+                    if file_mb > 1000.0:
+                        # Video > 1GB: Losslessly split into 2 halves for fast, seamless upload and mobile viewing
+                        await safe_edit(status_msg, f"✂️ حجم الفيديو ({file_mb:.1f}MB > 1GB) — جاري تقسيمه لنصفين بجودته الأصلية 100% لإرسال أسرع وأخف...")
+                        parts = await loop.run_in_executor(None, split_video_into_halves, video_path, req_dir)
                         if parts:
                             if len(parts) > 1:
                                 for p_idx, p in enumerate(parts, 1):
@@ -3883,8 +4075,11 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
                             else:
                                 prepared_items.append((parts[0], "video"))
                         else:
-                            await notify_stopped(f"تعذر تقسيم الفيديو الكبير ({file_mb:.1f}MB).")
+                            await notify_stopped(f"تعذر تقسيم الفيديو ({file_mb:.1f}MB).")
                             return
+                    else:
+                        await loop.run_in_executor(None, ensure_faststart, video_path)
+                        prepared_items.append((video_path, "video"))
                 else:
                     if file_mb <= 48.0:
                         prepared_items.append((video_path, "video"))
@@ -4116,6 +4311,7 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", start))
+    application.add_handler(CommandHandler("quality", quality_command))
     application.add_handler(CommandHandler("cookies", cookies_command))
     application.add_handler(CommandHandler("session", session_command))
     application.add_handler(CommandHandler("sessionid", session_command))
