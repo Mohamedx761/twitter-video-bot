@@ -57,7 +57,7 @@ AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0").strip().strip('"')
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads").strip().strip('"').strip("'"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip().strip('"').strip("'")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-BOT_VERSION = "v3.7-strict-720p-dedup-and-verified-half-split"
+BOT_VERSION = "v3.8-tiktok-photo-album-fix-and-verified-1gb-half-split"
 
 DB_PATH = Path("archive.db")
 
@@ -1294,7 +1294,10 @@ async def send_media_group_isolated(bot, chat_id, media_list, caption="", thumb_
 def dedupe_thumbnails(file_paths):
     videos = [fp for fp in file_paths if Path(fp).suffix.lower() in VIDEO_EXTS]
     images = [fp for fp in file_paths if Path(fp).suffix.lower() in IMAGE_EXTS]
-    if not videos:
+    if not videos or not images:
+        return file_paths
+    # If there are multiple images, this is a photo album/slideshow - do NOT discard them!
+    if len(images) > 1:
         return file_paths
     video_stems = {Path(v).stem for v in videos}
     result = list(videos)
@@ -1484,35 +1487,55 @@ def fix_media_file_extension(fpath: Path) -> Path:
 
 
 def _download_direct_url(url: str, dest: Path, timeout: int = 300, progress_cb=None) -> bool:
-    """Download a direct URL (e.g. Twitter/TikTok/Instagram CDN MP4 or photo) via urllib with proper headers."""
+    """Download a direct URL (e.g. Twitter/TikTok/Instagram CDN MP4 or photo) via urllib with proper headers and retries."""
+    headers_variants = []
+
+    # Variant 1: standard referer based on domain
     referer = "https://x.com/"
-    if "tiktok" in url or "tiktokcdn" in url or "tikwm" in url:
+    if "ssstik" in url or "tikcdn.io" in url:
+        referer = "https://ssstik.io/"
+    elif "tikwm" in url:
+        referer = "https://www.tikwm.com/"
+    elif "tiktok" in url or "tiktokcdn" in url:
         referer = "https://www.tiktok.com/"
     elif "instagram" in url or "cdninstagram" in url or "fbcdn.net" in url:
         referer = "https://www.instagram.com/"
 
-    headers = {
+    headers_variants.append({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Referer": referer,
-    }
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        resp = urllib.request.urlopen(req, timeout=timeout)
-        total = int(resp.headers.get("Content-Length", 0))
-        downloaded = 0
-        with open(dest, "wb") as f:
-            while True:
-                chunk = resp.read(65536)
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
-                if progress_cb and total > 0:
-                    progress_cb(downloaded, total)
-        return dest.exists() and dest.stat().st_size > 0
-    except Exception as e:
-        logger.error(f"Direct download failed: {e}")
-        return False
+    })
+    # Variant 2: no referer (bypasses anti-hotlinking on strict CDN nodes)
+    headers_variants.append({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    })
+
+    for headers in headers_variants:
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                total = int(resp.headers.get("Content-Length", 0))
+                downloaded = 0
+                with open(dest, "wb") as f:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if progress_cb and total > 0:
+                            progress_cb(downloaded, total)
+                if dest.exists() and dest.stat().st_size > 0:
+                    return True
+        except Exception as e:
+            logger.info(f"Direct download attempt with referer '{headers.get('Referer', 'None')}' failed: {e}")
+            if dest.exists():
+                try:
+                    dest.unlink()
+                except Exception:
+                    pass
+
+    return False
 
 
 def download_image_ytdlp(image_url: str, download_path: Path, idx: int, progress_cb=None) -> str:
@@ -1543,11 +1566,12 @@ def download_image_ytdlp(image_url: str, download_path: Path, idx: int, progress
         ext = "jpg"
     fpath = download_path / f"{idx:05d}.{ext}"
 
-    # If it is a direct image URL (including pbs.twimg.com, fbcdn.net) or Twitter/TikTok CDN video, download directly via HTTP!
+    # If it is a direct image URL (including pbs.twimg.com, tikcdn.io, fbcdn.net) or Twitter/TikTok CDN video, download directly via HTTP!
     if (
         "twimg.com" in image_url
         or "tiktokcdn" in image_url
         or "tikwm.com" in image_url
+        or "tikcdn.io" in image_url
         or "cdninstagram.com" in image_url
         or "fbcdn.net" in image_url
         or "mime_type=video_mp4" in image_url
@@ -2038,44 +2062,157 @@ def get_x_media(url: str) -> tuple[dict, list]:
     return info, media_urls
 
 
-def get_tiktok_media(url: str) -> tuple[dict, list]:
-    """Fetch direct watermark-free video or photo album URLs from TikTok via TikWM API.
-    Guarantees fast, reliable extraction for videos and photo slideshows without yt-dlp blocks."""
-    api_url = "https://www.tikwm.com/api/"
-    post_data = urllib.parse.urlencode({"url": url, "hd": 1}).encode("utf-8")
-    req = urllib.request.Request(
-        api_url,
-        data=post_data,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
-    )
+def resolve_tiktok_url(url: str) -> str:
+    """Follow HTTP redirects for shortlinks (vm.tiktok.com, vt.tiktok.com, /t/) to get canonical URL."""
+    if not any(d in url.lower() for d in ("vm.tiktok.com", "vt.tiktok.com", "tiktok.com/t/")):
+        return url
     try:
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
-            if data.get("code") == 0 and "data" in data:
-                d = data["data"]
-                info = {
-                    "title": d.get("title", ""),
-                    "description": d.get("title", ""),
-                    "uploader": (d.get("author") or {}).get("nickname", ""),
-                    "id": str(d.get("id", "")),
-                }
-                # Check for Photo Mode (images album)
-                images = d.get("images")
-                if isinstance(images, list) and images:
-                    valid_imgs = [img for img in images if isinstance(img, str) and img.startswith("http")]
-                    logger.info(f"TikWM API found {len(valid_imgs)} photo(s) in TikTok album")
-                    return info, valid_imgs
-
-                # Check for Video (hdplay preferred, then play, then wmplay)
-                video_url = d.get("hdplay") or d.get("play") or d.get("wmplay")
-                if video_url:
-                    logger.info("TikWM API found direct TikTok video URL")
-                    return info, [video_url]
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"}
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            final_url = resp.geturl()
+            if final_url and final_url != url:
+                logger.info(f"Resolved TikTok short URL: {url} -> {final_url}")
+                return final_url
     except Exception as e:
-        logger.warning(f"TikWM API attempt failed for {url}: {e}")
+        logger.info(f"Failed to resolve TikTok short URL {url}: {e}")
+    return url
+
+
+def get_ssstik_media(url: str) -> tuple[dict, list]:
+    """Fallback extractor using SSSTik to extract photos and video URLs from TikTok posts."""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    try:
+        req = urllib.request.Request('https://ssstik.io/en', headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as r:
+            html = r.read().decode('utf-8', errors='replace')
+            cookies = r.headers.get_all('Set-Cookie') or []
+            cookie_str = '; '.join(c.split(';')[0] for c in cookies)
+            m = re.findall(r"s_tt\s*=\s*['\"]([^'\"]+)['\"]", html) or re.findall(r"tt:\s*['\"]([^'\"]+)['\"]", html)
+            if not m:
+                return {}, []
+            token = m[0]
+
+            post_headers = {
+                'User-Agent': headers['User-Agent'],
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'HX-Request': 'true',
+                'HX-Trigger': '_gcaptcha_pt',
+                'HX-Target': 'target',
+                'HX-Current-URL': 'https://ssstik.io/en',
+                'Origin': 'https://ssstik.io',
+                'Referer': 'https://ssstik.io/en',
+            }
+            if cookie_str:
+                post_headers['Cookie'] = cookie_str
+
+            post_data = urllib.parse.urlencode({'id': url, 'locale': 'en', 'tt': token}).encode('utf-8')
+            req2 = urllib.request.Request('https://ssstik.io/abc?url=dl', data=post_data, headers=post_headers)
+            with urllib.request.urlopen(req2, timeout=10) as r2:
+                res_html = r2.read().decode('utf-8', errors='replace')
+
+                # Check for slideshow images
+                slide_urls = []
+                for link in re.findall(r'href=[\'"](https?://tikcdn\.io/ssstik/[^\'"]+)[\'"]', res_html):
+                    if link not in slide_urls:
+                        slide_urls.append(link)
+
+                if not slide_urls:
+                    for link in re.findall(r'href=[\'"](https?://[^\'"]+)[\'"]', res_html):
+                        if ("tikcdn" in link or "tiktok" in link) and link not in slide_urls and not link.endswith(".mp3"):
+                            slide_urls.append(link)
+
+                title_match = re.search(r'<p[^>]*class=[\'"][^\'"]*maintext[^\'"]*[\'"][^>]*>([^<]+)</p>', res_html)
+                title = title_match.group(1).strip() if title_match else ""
+
+                if slide_urls:
+                    logger.info(f"SSSTik found {len(slide_urls)} media URL(s) for TikTok: {url}")
+                    return {"title": title, "description": title}, slide_urls
+    except Exception as e:
+        logger.warning(f"SSSTik attempt failed for {url}: {e}")
+    return {}, []
+
+
+def get_tiktok_media(url: str) -> tuple[dict, list]:
+    """Fetch direct watermark-free video or photo album URLs from TikTok via TikWM API and SSSTik fallback.
+    Guarantees fast, reliable extraction for videos and photo slideshows without yt-dlp blocks."""
+    # Step 1: Follow redirects for shortlinks
+    target_url = resolve_tiktok_url(url)
+
+    # Step 2: Try TikWM with cleaned URL and target URL
+    urls_to_try = [target_url]
+    if "?" in target_url:
+        clean_u = target_url.split("?")[0]
+        if clean_u not in urls_to_try:
+            urls_to_try.insert(0, clean_u)
+
+    api_url = "https://www.tikwm.com/api/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+    for candidate_url in urls_to_try:
+        try:
+            post_data = urllib.parse.urlencode({"url": candidate_url, "hd": 1}).encode("utf-8")
+            req = urllib.request.Request(api_url, data=post_data, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                if data.get("code") == 0 and "data" in data:
+                    d = data["data"]
+                    info = {
+                        "title": d.get("title", ""),
+                        "description": d.get("title", ""),
+                        "uploader": (d.get("author") or {}).get("nickname", ""),
+                        "id": str(d.get("id", "")),
+                    }
+                    # Extract Photo Album (images / photos / image_post / slides)
+                    raw_images = d.get("images") or d.get("photos") or d.get("image_post") or d.get("slides")
+                    valid_imgs = []
+                    if isinstance(raw_images, list):
+                        for img in raw_images:
+                            if isinstance(img, str) and img:
+                                if img.startswith("http"):
+                                    valid_imgs.append(img)
+                                elif img.startswith("/"):
+                                    valid_imgs.append(f"https://www.tikwm.com{img}")
+                            elif isinstance(img, dict):
+                                for k in ("url", "src", "download_url", "display_url"):
+                                    val = img.get(k)
+                                    if isinstance(val, str) and val.startswith("http"):
+                                        valid_imgs.append(val)
+                                        break
+                                else:
+                                    img_url_dict = img.get("imageURL")
+                                    if isinstance(img_url_dict, dict) and img_url_dict.get("urlList"):
+                                        valid_imgs.append(img_url_dict["urlList"][0])
+
+                    if valid_imgs:
+                        logger.info(f"TikWM API found {len(valid_imgs)} photo(s) in TikTok album")
+                        return info, valid_imgs
+
+                    # Check for Video (hdplay preferred, then play, then wmplay)
+                    video_url = d.get("hdplay") or d.get("play") or d.get("wmplay")
+                    if video_url:
+                        if isinstance(video_url, str) and video_url.startswith("/"):
+                            video_url = f"https://www.tikwm.com{video_url}"
+                        logger.info("TikWM API found direct TikTok video URL")
+                        return info, [video_url]
+        except Exception as e:
+            logger.info(f"TikWM attempt failed for {candidate_url}: {e}")
+
+    # Step 3: Fallback to SSSTik
+    try:
+        ss_info, ss_urls = get_ssstik_media(target_url)
+        if ss_urls:
+            return ss_info, ss_urls
+    except Exception as e:
+        logger.warning(f"SSSTik fallback failed for {target_url}: {e}")
+
     return {}, []
 
 
@@ -3288,12 +3425,17 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
             logger.info(f"After carousel fetch: {len(all_image_urls)} image URL(s)")
 
     if is_tiktok and not all_image_urls:
-        logger.info("TikTok: no images from info files, trying --dump-single-json")
-        tiktok_urls = get_tiktok_image_urls(url)
-        for u in tiktok_urls:
-            if u not in all_image_urls:
-                all_image_urls.append(u)
-        logger.info(f"After TikTok fetch: {len(all_image_urls)} image URL(s)")
+        logger.info("TikTok: checking fallback extractors (TikWM & SSSTik)...")
+        tt_info, tt_urls = get_tiktok_media(url)
+        if not tt_urls:
+            tt_info, tt_urls = get_ssstik_media(url)
+        if tt_urls:
+            if not info and tt_info:
+                info = tt_info
+            for u in tt_urls:
+                if u not in all_image_urls:
+                    all_image_urls.append(u)
+        logger.info(f"After TikTok fallback fetch: {len(all_image_urls)} image URL(s)")
 
     image_urls = all_image_urls
     logger.info(f"Final image URL(s): {len(image_urls)}")
@@ -4110,26 +4252,25 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
                     continue
                 file_mb = os.path.getsize(video_path) / (1024 * 1024)
 
-                if use_local:
-                    if file_mb > 1000.0:
-                        # Video > 1GB: Losslessly split into 2 halves for fast, seamless upload and mobile viewing
-                        await safe_edit(status_msg, f"✂️ حجم الفيديو ({file_mb:.1f}MB > 1GB) — جاري تقسيمه لنصفين متساويين بجودته الأصلية 100% بدون أي ضغط...")
-                        parts = await loop.run_in_executor(None, split_video_into_halves, video_path, req_dir)
-                        if parts:
-                            if len(parts) > 1:
-                                for p_idx, p in enumerate(parts, 1):
-                                    half_name = "النصف الأول" if p_idx == 1 else "النصف الثاني"
-                                    part_info = f"📦 جزء {p_idx} من {len(parts)} ({half_name})"
-                                    p_cap = f"{caption}\n\n{part_info}" if caption else part_info
-                                    prepared_items.append((p, "video", p_cap))
-                            else:
-                                prepared_items.append((parts[0], "video"))
+                # Feature: Any video > 1GB (1000MB) is split into 2 equal halves losslessly (Part 1 = 1st half, Part 2 = 2nd half)
+                if file_mb > 1000.0:
+                    await safe_edit(status_msg, f"✂️ حجم الفيديو ({file_mb:.1f}MB > 1GB) — جاري تقسيمه لنصفين متساويين بجودته الأصلية 100% بدون أي ضغط...")
+                    parts = await loop.run_in_executor(None, split_video_into_halves, video_path, req_dir)
+                    if parts:
+                        if len(parts) > 1:
+                            for p_idx, p in enumerate(parts, 1):
+                                half_name = "النصف الأول" if p_idx == 1 else "النصف الثاني"
+                                part_info = f"📦 جزء {p_idx} من {len(parts)} ({half_name})"
+                                p_cap = f"{caption}\n\n{part_info}" if caption else part_info
+                                prepared_items.append((p, "video", p_cap))
                         else:
-                            await notify_stopped(f"تعذر تقسيم الفيديو ({file_mb:.1f}MB).")
-                            return
+                            prepared_items.append((parts[0], "video"))
                     else:
-                        await loop.run_in_executor(None, ensure_faststart, video_path)
-                        prepared_items.append((video_path, "video"))
+                        await notify_stopped(f"تعذر تقسيم الفيديو ({file_mb:.1f}MB).")
+                        return
+                elif use_local:
+                    await loop.run_in_executor(None, ensure_faststart, video_path)
+                    prepared_items.append((video_path, "video"))
                 else:
                     if file_mb <= 48.0:
                         prepared_items.append((video_path, "video"))
