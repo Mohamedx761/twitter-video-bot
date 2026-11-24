@@ -57,7 +57,7 @@ AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0").strip().strip('"')
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads").strip().strip('"').strip("'"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip().strip('"').strip("'")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-BOT_VERSION = "v3.8-tiktok-photo-album-fix-and-verified-1gb-half-split"
+BOT_VERSION = "v3.9-tiktok-photo-direct-extractor-webp-fix"
 
 DB_PATH = Path("archive.db")
 
@@ -733,7 +733,7 @@ URL_PATTERNS = [
     r"(?:https?://)?(?:www\.)?instagram\.com/(?:p|reel|reels|tv|stories)/[A-Za-z0-9_-]+\S*",
     r"(?:https?://)?(?:www\.)?instagram\.com/[A-Za-z0-9_\.]+/?(?:\?[^\s]*)?",
     # TikTok (all post, album, and shortlink formats)
-    r"(?:https?://)?(?:www\.|m\.|lite\.)?tiktok\.com/@[\w\.-]+/(?:video|photo)/\d+\S*",
+    r"(?:https?://)?(?:www\.|m\.|lite\.)?tiktok\.com/@[\w\.-]*/(?:video|photo)/\d+\S*",
     r"(?:https?://)?(?:www\.|m\.|lite\.)?tiktok\.com/t/[A-Za-z0-9_-]+\S*",
     r"(?:https?://)?(?:vm|vt|lite)\.tiktok\.com/[A-Za-z0-9_-]+\S*",
     r"(?:https?://)?(?:www\.|m\.)?tiktok\.com/v/\d+\S*",
@@ -1453,7 +1453,7 @@ def extract_thumbnail(video_path: str) -> str | None:
 
 def fix_media_file_extension(fpath: Path) -> Path:
     """Check magic bytes of the file and ensure its extension matches its actual content.
-    Prevents photos from being mistakenly saved and sent as corrupted/1-second empty videos."""
+    Prevents photos from being mistakenly saved as videos and separates audio tracks (.mp3/.m4a)."""
     if not fpath.exists() or fpath.stat().st_size < 12:
         return fpath
 
@@ -1470,6 +1470,10 @@ def fix_media_file_extension(fpath: Path) -> Path:
             new_ext = ".webp"
         elif header.startswith(b"GIF87a") or header.startswith(b"GIF89a"):
             new_ext = ".gif"
+        elif header.startswith(b"ID3") or header[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+            new_ext = ".mp3"
+        elif b"ftypM4A" in header[4:16]:
+            new_ext = ".m4a"
         elif b"ftyp" in header[4:16] or header.startswith(b"\x1a\x45\xdf\xa3"):
             new_ext = ".mp4"
 
@@ -1483,6 +1487,28 @@ def fix_media_file_extension(fpath: Path) -> Path:
     except Exception as e:
         logger.warning(f"Could not check/fix extension for {fpath}: {e}")
 
+    return fpath
+
+
+def convert_webp_to_jpg(fpath: Path) -> Path:
+    """Convert .webp images to .jpg so Telegram sendPhoto/sendMediaGroup accepts them reliably."""
+    if not fpath.exists() or fpath.suffix.lower() != ".webp":
+        return fpath
+    jpg_path = fpath.with_suffix(".jpg")
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(fpath), "-frames:v", "1", "-q:v", "2", str(jpg_path)],
+            capture_output=True, text=True, timeout=30
+        )
+        if proc.returncode == 0 and jpg_path.exists() and jpg_path.stat().st_size > 0:
+            try:
+                fpath.unlink()
+            except Exception:
+                pass
+            logger.info(f"Converted WebP to JPEG for Telegram compatibility: {fpath.name} -> {jpg_path.name}")
+            return jpg_path
+    except Exception as e:
+        logger.warning(f"Failed converting WebP {fpath.name} to JPEG: {e}")
     return fpath
 
 
@@ -2063,8 +2089,8 @@ def get_x_media(url: str) -> tuple[dict, list]:
 
 
 def resolve_tiktok_url(url: str) -> str:
-    """Follow HTTP redirects for shortlinks (vm.tiktok.com, vt.tiktok.com, /t/) to get canonical URL."""
-    if not any(d in url.lower() for d in ("vm.tiktok.com", "vt.tiktok.com", "tiktok.com/t/")):
+    """Follow HTTP redirects for shortlinks (vm/vt/lite.tiktok.com, /t/) to get canonical URL."""
+    if not any(d in url.lower() for d in ("vm.tiktok.com", "vt.tiktok.com", "lite.tiktok.com", "tiktok.com/t/")):
         return url
     try:
         req = urllib.request.Request(
@@ -2074,76 +2100,186 @@ def resolve_tiktok_url(url: str) -> str:
         with urllib.request.urlopen(req, timeout=8) as resp:
             final_url = resp.geturl()
             if final_url and final_url != url:
-                logger.info(f"Resolved TikTok short URL: {url} -> {final_url}")
-                return final_url
+                # Only accept resolved URL if it still points to a post (not a bare homepage redirect)
+                if any(seg in final_url.lower() for seg in ("/video/", "/photo/", "/v/")):
+                    logger.info(f"Resolved TikTok short URL: {url} -> {final_url}")
+                    return final_url
+                logger.info(f"TikTok redirect lost post path ({final_url}), keeping original: {url}")
     except Exception as e:
         logger.info(f"Failed to resolve TikTok short URL {url}: {e}")
     return url
 
 
+def get_tiktok_mobile_photos(url: str) -> tuple[dict, list]:
+    """Extract full-res JPEG photo URLs directly from TikTok mobile HTML (imagePost) without 3rd-party APIs."""
+    ios_ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+    candidates = []
+    if "?" in url and any(seg in url.lower() for seg in ("/photo/", "/video/")):
+        candidates.append(url.split("?")[0])
+    if url not in candidates:
+        candidates.append(url)
+
+    for candidate in candidates:
+        try:
+            req = urllib.request.Request(candidate, headers={"User-Agent": ios_ua})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                html = resp.read().decode("utf-8", errors="replace")
+            idx = html.find('"imagePost":{"images":[')
+            if idx == -1:
+                idx = html.find('"imagePost":')
+            if idx == -1:
+                continue
+            start = html.find("{", idx)
+            if start == -1:
+                continue
+            depth = 0
+            end = start
+            in_str = False
+            esc = False
+            for i in range(start, min(len(html), start + 250000)):
+                ch = html[i]
+                if esc:
+                    esc = False
+                    continue
+                if ch == "\\":
+                    esc = True
+                    continue
+                if ch == '"':
+                    in_str = not in_str
+                    continue
+                if not in_str:
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            end = i + 1
+                            break
+            if end <= start:
+                continue
+            ip_obj = json.loads(html[start:end])
+            urls = []
+            for im in ip_obj.get("images", []):
+                if not isinstance(im, dict):
+                    continue
+                url_list = (im.get("imageURL") or {}).get("urlList") or []
+                if url_list and isinstance(url_list[0], str) and url_list[0].startswith("http"):
+                    if url_list[0] not in urls:
+                        urls.append(url_list[0])
+            if urls:
+                desc = ""
+                desc_m = re.search(r'"desc":"((?:[^"\\]|\\.)*)"', html)
+                if desc_m:
+                    try:
+                        desc = json.loads(f'"{desc_m.group(1)}"')
+                    except Exception:
+                        desc = ""
+                logger.info(f"Direct TikTok Mobile extractor found {len(urls)} photo(s) for {candidate}")
+                return {"title": desc, "description": desc}, urls
+        except Exception as e:
+            logger.info(f"Direct TikTok Mobile check failed for {candidate}: {e}")
+    return {}, []
+
+
+def _is_ssstik_audio_or_avatar(href: str, anchor_text: str = "") -> bool:
+    """Return True if an SSSTik link points to MP3/M4A audio (/m/), avatar (/a/), or non-media."""
+    low_h = href.lower()
+    low_t = anchor_text.lower()
+    if "/ssstik/m/" in low_h or "/ssstik/a/" in low_h or low_h.endswith(".mp3"):
+        return True
+    if any(k in low_t for k in ("mp3", "audio", "music", "download app")):
+        return True
+    return False
+
+
 def get_ssstik_media(url: str) -> tuple[dict, list]:
-    """Fallback extractor using SSSTik to extract photos and video URLs from TikTok posts."""
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
-    try:
-        req = urllib.request.Request('https://ssstik.io/en', headers=headers)
-        with urllib.request.urlopen(req, timeout=8) as r:
-            html = r.read().decode('utf-8', errors='replace')
-            cookies = r.headers.get_all('Set-Cookie') or []
-            cookie_str = '; '.join(c.split(';')[0] for c in cookies)
-            m = re.findall(r"s_tt\s*=\s*['\"]([^'\"]+)['\"]", html) or re.findall(r"tt:\s*['\"]([^'\"]+)['\"]", html)
-            if not m:
-                return {}, []
-            token = m[0]
+    """Fallback extractor using SSSTik to extract photos and video URLs from TikTok posts (strictly excluding MP3)."""
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    candidates = []
+    if "?" in url and any(seg in url.lower() for seg in ("/photo/", "/video/")):
+        candidates.append(url.split("?")[0])
+    if url not in candidates:
+        candidates.append(url)
 
-            post_headers = {
-                'User-Agent': headers['User-Agent'],
-                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                'HX-Request': 'true',
-                'HX-Trigger': '_gcaptcha_pt',
-                'HX-Target': 'target',
-                'HX-Current-URL': 'https://ssstik.io/en',
-                'Origin': 'https://ssstik.io',
-                'Referer': 'https://ssstik.io/en',
-            }
-            if cookie_str:
-                post_headers['Cookie'] = cookie_str
+    for candidate in candidates:
+        for attempt in range(2):
+            try:
+                req = urllib.request.Request("https://ssstik.io/en", headers={"User-Agent": ua})
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    html = r.read().decode("utf-8", errors="replace")
+                    cookies = r.headers.get_all("Set-Cookie") or []
+                    cookie_str = "; ".join(c.split(";")[0] for c in cookies)
+                    m = re.findall(r"s_tt\s*=\s*['\"]([^'\"]+)['\"]", html) or re.findall(r"tt:\s*['\"]([^'\"]+)['\"]", html)
+                    if not m:
+                        break
+                    token = m[0]
 
-            post_data = urllib.parse.urlencode({'id': url, 'locale': 'en', 'tt': token}).encode('utf-8')
-            req2 = urllib.request.Request('https://ssstik.io/abc?url=dl', data=post_data, headers=post_headers)
-            with urllib.request.urlopen(req2, timeout=10) as r2:
-                res_html = r2.read().decode('utf-8', errors='replace')
+                    post_headers = {
+                        "User-Agent": ua,
+                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                        "HX-Request": "true",
+                        "HX-Trigger": "_gcaptcha_pt",
+                        "HX-Target": "target",
+                        "HX-Current-URL": "https://ssstik.io/en",
+                        "Origin": "https://ssstik.io",
+                        "Referer": "https://ssstik.io/en",
+                    }
+                    if cookie_str:
+                        post_headers["Cookie"] = cookie_str
 
-                # Check for slideshow images
-                slide_urls = []
-                for link in re.findall(r'href=[\'"](https?://tikcdn\.io/ssstik/[^\'"]+)[\'"]', res_html):
-                    if link not in slide_urls:
-                        slide_urls.append(link)
+                    post_data = urllib.parse.urlencode({"id": candidate, "locale": "en", "tt": token}).encode("utf-8")
+                    req2 = urllib.request.Request("https://ssstik.io/abc?url=dl", data=post_data, headers=post_headers)
+                    with urllib.request.urlopen(req2, timeout=10) as r2:
+                        res_html = r2.read().decode("utf-8", errors="replace")
 
-                if not slide_urls:
-                    for link in re.findall(r'href=[\'"](https?://[^\'"]+)[\'"]', res_html):
-                        if ("tikcdn" in link or "tiktok" in link) and link not in slide_urls and not link.endswith(".mp3"):
-                            slide_urls.append(link)
+                    slide_urls = []
+                    video_urls = []
+                    for am in re.finditer(r'<a[^>]*href=[\'"](https?://[^\'"]+)[\'"][^>]*>(.*?)</a>', res_html, re.S | re.I):
+                        link = am.group(1).strip()
+                        atext = re.sub(r"<[^>]+>", " ", am.group(2)).strip()
+                        if _is_ssstik_audio_or_avatar(link, atext):
+                            continue
+                        if "tikcdn.io/ssstik/" not in link and "tiktok" not in link:
+                            continue
+                        if "slide" in atext.lower():
+                            if link not in slide_urls:
+                                slide_urls.append(link)
+                        elif "without watermark" in atext.lower() or "watermark" in atext.lower() or "hd" in atext.lower():
+                            if link not in video_urls:
+                                video_urls.append(link)
+                        else:
+                            if link not in slide_urls:
+                                slide_urls.append(link)
 
-                title_match = re.search(r'<p[^>]*class=[\'"][^\'"]*maintext[^\'"]*[\'"][^>]*>([^<]+)</p>', res_html)
-                title = title_match.group(1).strip() if title_match else ""
+                    title_match = re.search(
+                        r'<(p|div|span)[^>]*class=[\'"][^\'"]*(?:maintext|ssr-caption)[^\'"]*[\'"][^>]*>(.*?)</\1>',
+                        res_html,
+                        re.S,
+                    )
+                    title = re.sub(r"<[^>]+>", " ", title_match.group(2)).strip() if title_match else ""
 
-                if slide_urls:
-                    logger.info(f"SSSTik found {len(slide_urls)} media URL(s) for TikTok: {url}")
-                    return {"title": title, "description": title}, slide_urls
-    except Exception as e:
-        logger.warning(f"SSSTik attempt failed for {url}: {e}")
+                    chosen = slide_urls if slide_urls else video_urls[:1]
+                    if chosen:
+                        logger.info(f"SSSTik found {len(chosen)} media URL(s) for TikTok: {candidate}")
+                        return {"title": title, "description": title}, chosen
+            except Exception as e:
+                logger.warning(f"SSSTik attempt {attempt+1} failed for {candidate}: {e}")
+                if attempt == 0:
+                    time.sleep(0.6)
     return {}, []
 
 
 def get_tiktok_media(url: str) -> tuple[dict, list]:
-    """Fetch direct watermark-free video or photo album URLs from TikTok via TikWM API and SSSTik fallback.
-    Guarantees fast, reliable extraction for videos and photo slideshows without yt-dlp blocks."""
+    """Fetch direct watermark-free video or photo album URLs from TikTok via Mobile HTML, TikWM API, and SSSTik."""
     # Step 1: Follow redirects for shortlinks
     target_url = resolve_tiktok_url(url)
 
-    # Step 2: Try TikWM with cleaned URL and target URL
+    # Step 2: Direct TikTok Mobile HTML extractor (fastest & native JPEG for photo slideshows, zero 3rd-party dependency)
+    mob_info, mob_urls = get_tiktok_mobile_photos(target_url)
+    if mob_urls:
+        return mob_info, mob_urls
+
+    # Step 3: Try TikWM with cleaned URL and target URL (short 5s timeout to avoid blocking on 502/timeouts)
     urls_to_try = [target_url]
     if "?" in target_url:
         clean_u = target_url.split("?")[0]
@@ -2160,7 +2296,7 @@ def get_tiktok_media(url: str) -> tuple[dict, list]:
         try:
             post_data = urllib.parse.urlencode({"url": candidate_url, "hd": 1}).encode("utf-8")
             req = urllib.request.Request(api_url, data=post_data, headers=headers)
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode("utf-8", errors="replace"))
                 if data.get("code") == 0 and "data" in data:
                     d = data["data"]
@@ -2203,9 +2339,12 @@ def get_tiktok_media(url: str) -> tuple[dict, list]:
                         logger.info("TikWM API found direct TikTok video URL")
                         return info, [video_url]
         except Exception as e:
+            err_s = str(e).lower()
             logger.info(f"TikWM attempt failed for {candidate_url}: {e}")
+            if "timed out" in err_s or "502" in err_s or "503" in err_s or "403" in err_s:
+                break
 
-    # Step 3: Fallback to SSSTik
+    # Step 4: Fallback to SSSTik
     try:
         ss_info, ss_urls = get_ssstik_media(target_url)
         if ss_urls:
@@ -3371,8 +3510,11 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
                             all_image_urls.append(u)
 
         if is_tiktok:
-            after_files = set(f.name for f in download_path.iterdir() if f.is_file() and not f.name.endswith(".info.json"))
-            if not (after_files - before_files) and not all_image_urls:
+            after_visual = set(
+                f.name for f in download_path.iterdir()
+                if f.is_file() and f.suffix.lower() in (VIDEO_EXTS + IMAGE_EXTS)
+            )
+            if not (after_visual - before_files) and not all_image_urls:
                 tt_info, tt_urls = get_tiktok_media(url)
                 if tt_urls:
                     if not info and tt_info:
@@ -3424,11 +3566,13 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
                     all_image_urls.append(u)
             logger.info(f"After carousel fetch: {len(all_image_urls)} image URL(s)")
 
-    if is_tiktok and not all_image_urls:
-        logger.info("TikTok: checking fallback extractors (TikWM & SSSTik)...")
+    has_visual_file = any(
+        f.is_file() and f.name not in before_files and f.suffix.lower() in (VIDEO_EXTS + IMAGE_EXTS)
+        for f in download_path.iterdir()
+    )
+    if is_tiktok and not all_image_urls and not has_visual_file:
+        logger.info("TikTok: checking fallback extractors (Mobile HTML, TikWM & SSSTik)...")
         tt_info, tt_urls = get_tiktok_media(url)
-        if not tt_urls:
-            tt_info, tt_urls = get_ssstik_media(url)
         if tt_urls:
             if not info and tt_info:
                 info = tt_info
@@ -3483,8 +3627,9 @@ def extract_media(url: str, download_path: Path, chat_id: int, status_msg_id: in
         except Exception:
             pass
 
+    downloaded_files = [str(convert_webp_to_jpg(fix_media_file_extension(Path(fp)))) for fp in downloaded_files if os.path.exists(fp)]
+    downloaded_files = [fp for fp in downloaded_files if fp.lower().endswith(VIDEO_EXTS + IMAGE_EXTS)]
     downloaded_files = dedupe_thumbnails(downloaded_files)
-    downloaded_files = [str(fix_media_file_extension(Path(fp))) for fp in downloaded_files if os.path.exists(fp)]
 
     if not downloaded_files:
         tail = (last_stderr or "").strip().splitlines()
@@ -4217,7 +4362,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE, force_u
             caption = (info or {}).get("description", "") or (info or {}).get("title", "") or ""
             await safe_edit(status_msg, f"⬆️ تجهيز {len(file_paths)} ملف للرفع...")
 
-            file_paths = [str(fix_media_file_extension(Path(fp))) for fp in file_paths if os.path.exists(fp)]
+            file_paths = [str(convert_webp_to_jpg(fix_media_file_extension(Path(fp)))) for fp in file_paths if os.path.exists(fp)]
             # Deduplicate paths to strictly avoid sending the same video twice
             dedup_paths = []
             for fp in file_paths:
