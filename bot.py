@@ -57,7 +57,7 @@ AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0").strip().strip('"')
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads").strip().strip('"').strip("'"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip().strip('"').strip("'")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-BOT_VERSION = "v3.9-tiktok-photo-direct-extractor-webp-fix"
+BOT_VERSION = "v4.0-tiktok-robust-extractor-and-1gb-split-verified"
 
 DB_PATH = Path("archive.db")
 
@@ -2092,12 +2092,17 @@ def resolve_tiktok_url(url: str) -> str:
     """Follow HTTP redirects for shortlinks (vm/vt/lite.tiktok.com, /t/) to get canonical URL."""
     if not any(d in url.lower() for d in ("vm.tiktok.com", "vt.tiktok.com", "lite.tiktok.com", "tiktok.com/t/")):
         return url
+    mobile_ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
     try:
         req = urllib.request.Request(
             url,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"}
+            headers={
+                "User-Agent": mobile_ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            }
         )
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             final_url = resp.geturl()
             if final_url and final_url != url:
                 # Only accept resolved URL if it still points to a post (not a bare homepage redirect)
@@ -2111,8 +2116,13 @@ def resolve_tiktok_url(url: str) -> str:
 
 
 def get_tiktok_mobile_photos(url: str) -> tuple[dict, list]:
-    """Extract full-res JPEG photo URLs directly from TikTok mobile HTML (imagePost) without 3rd-party APIs."""
+    """Extract full-res JPEG photo URLs directly from TikTok mobile HTML (JSON script tags / imagePost) without 3rd-party APIs."""
     ios_ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+    headers = {
+        "User-Agent": ios_ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
     candidates = []
     if "?" in url and any(seg in url.lower() for seg in ("/photo/", "/video/")):
         candidates.append(url.split("?")[0])
@@ -2121,61 +2131,103 @@ def get_tiktok_mobile_photos(url: str) -> tuple[dict, list]:
 
     for candidate in candidates:
         try:
-            req = urllib.request.Request(candidate, headers={"User-Agent": ios_ua})
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            req = urllib.request.Request(candidate, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 html = resp.read().decode("utf-8", errors="replace")
+
+            # Method 1: Search all JSON script tags (api-data, __UNIVERSAL_DATA_FOR_REHYDRATION__, etc.)
+            script_matches = re.findall(r'<script[^>]+type=[\'"]application/json[\'"][^>]*>(.*?)</script>', html, re.S)
+            for s_json in script_matches:
+                s_json = s_json.strip()
+                if '"imagePost"' not in s_json and '"images"' not in s_json:
+                    continue
+                try:
+                    data = json.loads(s_json)
+                    def find_item_struct(obj):
+                        if isinstance(obj, dict):
+                            if "imagePost" in obj and isinstance(obj["imagePost"], dict):
+                                return obj
+                            for v in obj.values():
+                                res = find_item_struct(v)
+                                if res:
+                                    return res
+                        elif isinstance(obj, list):
+                            for v in obj:
+                                res = find_item_struct(v)
+                                if res:
+                                    return res
+                        return None
+
+                    item = find_item_struct(data)
+                    if item:
+                        images = (item.get("imagePost") or {}).get("images") or []
+                        urls = []
+                        for im in images:
+                            if isinstance(im, dict):
+                                ul = (im.get("imageURL") or {}).get("urlList") or []
+                                if ul and isinstance(ul[0], str) and ul[0].startswith("http"):
+                                    if ul[0] not in urls:
+                                        urls.append(ul[0])
+                        if urls:
+                            desc = item.get("desc") or ""
+                            logger.info(f"Direct TikTok Mobile JSON script extractor found {len(urls)} photo(s) for {candidate}")
+                            return {"title": desc, "description": desc}, urls
+                except Exception:
+                    continue
+
+            # Method 2: Fallback manual scan for "imagePost" block
             idx = html.find('"imagePost":{"images":[')
             if idx == -1:
                 idx = html.find('"imagePost":')
-            if idx == -1:
-                continue
-            start = html.find("{", idx)
-            if start == -1:
-                continue
-            depth = 0
-            end = start
-            in_str = False
-            esc = False
-            for i in range(start, min(len(html), start + 250000)):
-                ch = html[i]
-                if esc:
+            if idx != -1:
+                start = html.find("{", idx)
+                if start != -1:
+                    depth = 0
+                    end = start
+                    in_str = False
                     esc = False
-                    continue
-                if ch == "\\":
-                    esc = True
-                    continue
-                if ch == '"':
-                    in_str = not in_str
-                    continue
-                if not in_str:
-                    if ch == "{":
-                        depth += 1
-                    elif ch == "}":
-                        depth -= 1
-                        if depth == 0:
-                            end = i + 1
-                            break
-            if end <= start:
-                continue
-            ip_obj = json.loads(html[start:end])
-            urls = []
-            for im in ip_obj.get("images", []):
-                if not isinstance(im, dict):
-                    continue
-                url_list = (im.get("imageURL") or {}).get("urlList") or []
-                if url_list and isinstance(url_list[0], str) and url_list[0].startswith("http"):
-                    if url_list[0] not in urls:
-                        urls.append(url_list[0])
-            if urls:
-                desc = ""
-                desc_m = re.search(r'"desc":"((?:[^"\\]|\\.)*)"', html)
-                if desc_m:
-                    try:
-                        desc = json.loads(f'"{desc_m.group(1)}"')
-                    except Exception:
-                        desc = ""
-                logger.info(f"Direct TikTok Mobile extractor found {len(urls)} photo(s) for {candidate}")
-                return {"title": desc, "description": desc}, urls
+                    for i in range(start, min(len(html), start + 250000)):
+                        ch = html[i]
+                        if esc:
+                            esc = False
+                            continue
+                        if ch == "\\":
+                            esc = True
+                            continue
+                        if ch == '"':
+                            in_str = not in_str
+                            continue
+                        if not in_str:
+                            if ch == "{":
+                                depth += 1
+                            elif ch == "}":
+                                depth -= 1
+                                if depth == 0:
+                                    end = i + 1
+                                    break
+                    if end > start:
+                        try:
+                            ip_obj = json.loads(html[start:end])
+                            urls = []
+                            for im in ip_obj.get("images", []):
+                                if not isinstance(im, dict):
+                                    continue
+                                url_list = (im.get("imageURL") or {}).get("urlList") or []
+                                if url_list and isinstance(url_list[0], str) and url_list[0].startswith("http"):
+                                    if url_list[0] not in urls:
+                                        urls.append(url_list[0])
+                            if urls:
+                                desc = ""
+                                desc_m = re.search(r'"desc":"((?:[^"\\]|\\.)*)"', html)
+                                if desc_m:
+                                    try:
+                                        desc = json.loads(f'"{desc_m.group(1)}"')
+                                    except Exception:
+                                        desc = ""
+                                logger.info(f"Direct TikTok Mobile block extractor found {len(urls)} photo(s) for {candidate}")
+                                return {"title": desc, "description": desc}, urls
+                        except Exception:
+                            pass
         except Exception as e:
             logger.info(f"Direct TikTok Mobile check failed for {candidate}: {e}")
     return {}, []
@@ -2279,12 +2331,20 @@ def get_tiktok_media(url: str) -> tuple[dict, list]:
     if mob_urls:
         return mob_info, mob_urls
 
-    # Step 3: Try TikWM with cleaned URL and target URL (short 5s timeout to avoid blocking on 502/timeouts)
-    urls_to_try = [target_url]
-    if "?" in target_url:
-        clean_u = target_url.split("?")[0]
-        if clean_u not in urls_to_try:
-            urls_to_try.insert(0, clean_u)
+    if target_url != url:
+        mob_info2, mob_urls2 = get_tiktok_mobile_photos(url)
+        if mob_urls2:
+            return mob_info2, mob_urls2
+
+    # Step 3: Try TikWM with target URL, shortlink URL, and cleaned URLs (timeout 12s)
+    urls_to_try = []
+    for u in (target_url, url):
+        if u and u not in urls_to_try:
+            if "?" in u:
+                clean_u = u.split("?")[0]
+                if clean_u not in urls_to_try:
+                    urls_to_try.append(clean_u)
+            urls_to_try.append(u)
 
     api_url = "https://www.tikwm.com/api/"
     headers = {
@@ -2296,7 +2356,7 @@ def get_tiktok_media(url: str) -> tuple[dict, list]:
         try:
             post_data = urllib.parse.urlencode({"url": candidate_url, "hd": 1}).encode("utf-8")
             req = urllib.request.Request(api_url, data=post_data, headers=headers)
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=12) as resp:
                 data = json.loads(resp.read().decode("utf-8", errors="replace"))
                 if data.get("code") == 0 and "data" in data:
                     d = data["data"]
@@ -2341,16 +2401,17 @@ def get_tiktok_media(url: str) -> tuple[dict, list]:
         except Exception as e:
             err_s = str(e).lower()
             logger.info(f"TikWM attempt failed for {candidate_url}: {e}")
-            if "timed out" in err_s or "502" in err_s or "503" in err_s or "403" in err_s:
+            if "502" in err_s or "503" in err_s or "403" in err_s:
                 break
 
     # Step 4: Fallback to SSSTik
-    try:
-        ss_info, ss_urls = get_ssstik_media(target_url)
-        if ss_urls:
-            return ss_info, ss_urls
-    except Exception as e:
-        logger.warning(f"SSSTik fallback failed for {target_url}: {e}")
+    for u_fallback in (target_url, url):
+        try:
+            ss_info, ss_urls = get_ssstik_media(u_fallback)
+            if ss_urls:
+                return ss_info, ss_urls
+        except Exception as e:
+            logger.warning(f"SSSTik fallback failed for {u_fallback}: {e}")
 
     return {}, []
 
